@@ -26,6 +26,42 @@ if (!(Test-Path $exePath)) {
     throw "media_server.exe bulunamadi. Once build_media.ps1 calistirin."
 }
 
+function Start-ProcessWithEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][hashtable]$Environment,
+        [string]$RedirectStandardOutput = "",
+        [string]$RedirectStandardError = ""
+    )
+
+    $prevValues = @{}
+    foreach ($kv in $Environment.GetEnumerator()) {
+        $key = [string]$kv.Key
+        $prevValues[$key] = [Environment]::GetEnvironmentVariable($key, "Process")
+        [Environment]::SetEnvironmentVariable($key, [string]$kv.Value, "Process")
+    }
+    try {
+        $args = @{
+            FilePath = $FilePath
+            WorkingDirectory = $WorkingDirectory
+            WindowStyle = "Hidden"
+            PassThru = $true
+        }
+        if (-not [string]::IsNullOrWhiteSpace($RedirectStandardOutput)) {
+            $args["RedirectStandardOutput"] = $RedirectStandardOutput
+        }
+        if (-not [string]::IsNullOrWhiteSpace($RedirectStandardError)) {
+            $args["RedirectStandardError"] = $RedirectStandardError
+        }
+        return Start-Process @args
+    } finally {
+        foreach ($kv in $prevValues.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable([string]$kv.Key, $kv.Value, "Process")
+        }
+    }
+}
+
 function Start-MediaServerInstance {
     param(
         [int]$Port,
@@ -59,10 +95,11 @@ function Start-MediaServerInstance {
         $childEnv["MEDIA_REDIS_PASSWORD"] = ""
     }
 
-    Start-Process -FilePath $exePath `
-        -WorkingDirectory $projectRoot -WindowStyle Hidden -PassThru `
+    Start-ProcessWithEnvironment -FilePath $exePath `
+        -WorkingDirectory $projectRoot `
         -Environment $childEnv `
-        -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        -RedirectStandardOutput $stdout `
+        -RedirectStandardError $stderr
 }
 
 function Wait-ServerReady {

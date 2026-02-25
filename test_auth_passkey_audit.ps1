@@ -21,6 +21,30 @@ function Wait-Health {
     }
     return $false
 }
+function Start-ProcessWithEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][hashtable]$Environment
+    )
+
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $FilePath
+    $startInfo.WorkingDirectory = $WorkingDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+
+    foreach ($kv in $Environment.GetEnumerator()) {
+        $key = [string]$kv.Key
+        $value = [string]$kv.Value
+        $startInfo.EnvironmentVariables[$key] = $value
+    }
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $startInfo
+    [void]$proc.Start()
+    return $proc
+}
 
 function Convert-ToBase64Url {
     param([byte[]]$Bytes)
@@ -83,7 +107,7 @@ try {
         GIGACHAD_STORAGE_MODE = "hybrid"
     }
 
-    $server = Start-Process -FilePath $exePath -WorkingDirectory $projectRoot -PassThru -WindowStyle Hidden -Environment $childEnv
+    $server = Start-ProcessWithEnvironment -FilePath $exePath -WorkingDirectory $projectRoot -Environment $childEnv
     if (!(Wait-Health -Port $Port -TimeoutSec $TimeoutSec)) { throw "Server hazir degil." }
 
     $runId = Get-Date -Format "yyyyMMddHHmmssfff"

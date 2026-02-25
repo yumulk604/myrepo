@@ -2193,6 +2193,35 @@ bool passkeyCounterStrictEnabled() {
     return strictValue != 0;
 }
 
+std::string passkeySignatureMode() {
+    static const std::string mode = []() {
+        std::string raw = toLower(trimWhitespace(getEnvStringWithFallback(
+            "GIGACHAD_PASSKEY_SIGNATURE_MODE",
+            "MEDIA_PASSKEY_SIGNATURE_MODE",
+            "hmac"
+        )));
+        if (raw == "es256") return std::string("es256");
+        return std::string("hmac");
+    }();
+    return mode;
+}
+
+bool validatePasskeyCredentialMaterial(const std::string& credentialKeyMaterial, std::string& errorReason) {
+    if (credentialKeyMaterial.empty()) {
+        errorReason = "Credential key is missing";
+        return false;
+    }
+    if (passkeySignatureMode() == "hmac") {
+        return true;
+    }
+    const std::string decoded = base64UrlDecodeToString(credentialKeyMaterial);
+    if (decoded.size() < 32) {
+        errorReason = "ES256 publicKey must be base64url and at least 32 bytes";
+        return false;
+    }
+    return true;
+}
+
 std::string passkeyRpId() {
     static const std::string rpId = trimWhitespace(getEnvStringWithFallback("GIGACHAD_PASSKEY_RP_ID", "MEDIA_PASSKEY_RP_ID", ""));
     return rpId;
@@ -2481,6 +2510,57 @@ bool validatePasskeySignatureHmac(
         return false;
     }
     return true;
+}
+
+bool validatePasskeySignatureEs256(
+    const std::string& credentialPublicKey,
+    const std::string& authenticatorDataB64,
+    const std::string& clientDataJsonB64,
+    const std::string& signatureB64,
+    std::string& errorReason
+) {
+    if (!validatePasskeyCredentialMaterial(credentialPublicKey, errorReason)) {
+        return false;
+    }
+    if (base64UrlDecodeToBytes(authenticatorDataB64).empty()) {
+        errorReason = "Invalid authenticatorData for signature validation";
+        return false;
+    }
+    if (decodePossiblyBase64UrlJson(clientDataJsonB64).empty()) {
+        errorReason = "Invalid clientDataJSON for signature validation";
+        return false;
+    }
+    if (base64UrlDecodeToBytes(signatureB64).empty()) {
+        errorReason = "Invalid signature encoding";
+        return false;
+    }
+    errorReason = "ES256 passkey signature verification is not enabled in this build";
+    return false;
+}
+
+bool validatePasskeySignature(
+    const std::string& credentialKeyMaterial,
+    const std::string& authenticatorDataB64,
+    const std::string& clientDataJsonB64,
+    const std::string& signatureB64,
+    std::string& errorReason
+) {
+    if (passkeySignatureMode() == "es256") {
+        return validatePasskeySignatureEs256(
+            credentialKeyMaterial,
+            authenticatorDataB64,
+            clientDataJsonB64,
+            signatureB64,
+            errorReason
+        );
+    }
+    return validatePasskeySignatureHmac(
+        credentialKeyMaterial,
+        authenticatorDataB64,
+        clientDataJsonB64,
+        signatureB64,
+        errorReason
+    );
 }
 
 std::string generatePasskeyChallenge() {
@@ -3453,6 +3533,12 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
             res.body = "{\"error\":\"Missing required fields\"}";
             return res;
         }
+        if (!validatePasskeyCredentialMaterial(publicKey, passkeyValidationError)) {
+            res.status = 400;
+            res.statusText = "Bad Request";
+            res.body = "{\"error\":\"" + escapeJSONString(passkeyValidationError) + "\"}";
+            return res;
+        }
         if (passkeyStrictMetadataEnabled()) {
             if (reqRpId.empty() || reqOrigin.empty() || clientDataType.empty() ||
                 clientDataJsonB64.empty() || authenticatorDataB64.empty()) {
@@ -3659,7 +3745,7 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
                 });
                 if (credIt != creds.end()) {
                     if (passkeyStrictMetadataEnabled()) {
-                        if (!validatePasskeySignatureHmac(
+                        if (!validatePasskeySignature(
                                 credIt->publicKey,
                                 authenticatorDataB64,
                                 clientDataJsonB64,
@@ -4736,6 +4822,7 @@ HTTPResponse handleRequest(const HTTPRequest& req) {
       "Passkey RP/Origin env": "GIGACHAD_PASSKEY_RP_ID + GIGACHAD_PASSKEY_ALLOWED_ORIGINS (MEDIA_* aliases)",
       "Passkey strict metadata env": "GIGACHAD_PASSKEY_STRICT_METADATA or MEDIA_PASSKEY_STRICT_METADATA",
       "Passkey counter policy env": "GIGACHAD_PASSKEY_COUNTER_STRICT or MEDIA_PASSKEY_COUNTER_STRICT",
+      "Passkey signature mode env": "GIGACHAD_PASSKEY_SIGNATURE_MODE (hmac|es256) or MEDIA_PASSKEY_SIGNATURE_MODE",
       "Passkey rate-limit env": "GIGACHAD_PASSKEY_RATE_MAX_ATTEMPTS + GIGACHAD_PASSKEY_RATE_WINDOW_SEC (MEDIA_* aliases)",
       "Passkey lockout env": "GIGACHAD_PASSKEY_LOCKOUT_THRESHOLD + GIGACHAD_PASSKEY_LOCKOUT_SEC (MEDIA_* aliases)",
       "Auth audit log": "data/auth_audit.jsonl"

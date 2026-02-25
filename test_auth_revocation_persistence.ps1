@@ -20,6 +20,30 @@ function Wait-Health {
     }
     return $false
 }
+function Start-ProcessWithEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][hashtable]$Environment
+    )
+
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $FilePath
+    $startInfo.WorkingDirectory = $WorkingDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+
+    foreach ($kv in $Environment.GetEnumerator()) {
+        $key = [string]$kv.Key
+        $value = [string]$kv.Value
+        $startInfo.EnvironmentVariables[$key] = $value
+    }
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $startInfo
+    [void]$proc.Start()
+    return $proc
+}
 
 function Start-TestServer {
     param([int]$Port, [string]$JwtSecret)
@@ -31,7 +55,7 @@ function Start-TestServer {
         GIGACHAD_EVENT_BUS = "memory"
         MEDIA_EVENT_BUS = "memory"
     }
-    return Start-Process -FilePath $exePath -WorkingDirectory $projectRoot -PassThru -WindowStyle Hidden -Environment $childEnv
+    return Start-ProcessWithEnvironment -FilePath $exePath -WorkingDirectory $projectRoot -Environment $childEnv
 }
 
 $s1 = $null

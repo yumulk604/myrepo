@@ -47,6 +47,8 @@
 - [+] Realtime Core: Auth audit log eklendi (data/auth_audit.jsonl).
 - [+] Realtime Core: Passkey tenant-aware credential izolasyonu sikilastirildi (tenant+credentialId lookup).
 - [+] Realtime Core: Passkey credential persistence eklendi (SQLite + disk fallback, restart sonrasi login devam).
+- [+] Realtime Core: Passkey signature mode konfigurasyonu eklendi (`GIGACHAD_PASSKEY_SIGNATURE_MODE` / `MEDIA_PASSKEY_SIGNATURE_MODE`, `hmac|es256`).
+- [+] Realtime Core: Passkey imza dogrulama katmani modulerlestirildi (dispatcher: HMAC aktif, ES256 scaffold kontrollu hata mesaji ile hazir).
 - [-] Realtime Core: Passkey tam WebAuthn COSE public-key (ECDSA/EdDSA) signature verification (production hardening).
 
 - [-] Media Plane: 2-10 kisi icin P2P WebRTC akisi.
@@ -95,6 +97,9 @@
 - [+] test_auth_passkey.ps1 tenant-cross login negatif senaryosu ile genisletildi.
 - [+] test_auth_passkey_audit.ps1 eklendi ve PASS alindi (auth_audit event tipleri dogrulandi).
 - [+] CI passkey faz testine audit-log + tenant-cross kontrolu eklendi.
+- [+] Passkey signature mode env dokumantasyonu /api dokuman cikisina eklendi.
+- [+] PowerShell test altyapisi guncellendi: `Start-Process -Environment` yerine PS5.1 uyumlu `Start-ProcessWithEnvironment` helper kullanimi.
+- [+] Auth/Passkey/WS test scriptleri yerel ortamda yeniden calistirildi (port cakismasini azaltmak icin ozellestirilmis portlarla PASS dogrulamasi).
 
 
 

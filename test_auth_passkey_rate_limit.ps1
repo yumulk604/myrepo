@@ -23,6 +23,30 @@ function Wait-Health {
     }
     return $false
 }
+function Start-ProcessWithEnvironment {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [Parameter(Mandatory = $true)][hashtable]$Environment
+    )
+
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $FilePath
+    $startInfo.WorkingDirectory = $WorkingDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+
+    foreach ($kv in $Environment.GetEnumerator()) {
+        $key = [string]$kv.Key
+        $value = [string]$kv.Value
+        $startInfo.EnvironmentVariables[$key] = $value
+    }
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $startInfo
+    [void]$proc.Start()
+    return $proc
+}
 
 $server = $null
 try {
@@ -41,7 +65,7 @@ try {
         MEDIA_PASSKEY_RATE_WINDOW_SEC = "60"
     }
 
-    $server = Start-Process -FilePath $exePath -WorkingDirectory $projectRoot -PassThru -WindowStyle Hidden -Environment $childEnv
+    $server = Start-ProcessWithEnvironment -FilePath $exePath -WorkingDirectory $projectRoot -Environment $childEnv
     if (!(Wait-Health -Port $Port -TimeoutSec $TimeoutSec)) {
         throw "Server hazir degil."
     }
