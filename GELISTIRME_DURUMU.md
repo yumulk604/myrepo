@@ -93,6 +93,8 @@
 - [+] test_auth_passkey_lockout.ps1 eklendi ve PASS alindi (tekrarli bad-signature denemelerinde lockout 429).
 - [+] CI pipeline'a passkey lockout test adimi eklendi.
 - [+] test_auth_passkey.ps1 tenant-cross login negatif senaryosu ile genisletildi.
+- [+] test_auth_passkey_audit.ps1 eklendi ve PASS alindi (auth_audit event tipleri dogrulandi).
+- [+] CI passkey faz testine audit-log + tenant-cross kontrolu eklendi.
 
 
 

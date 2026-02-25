@@ -11,6 +11,7 @@ on:
       - "test_auth_passkey_persistence.ps1"
       - "test_auth_passkey_rate_limit.ps1"
       - "test_auth_passkey_lockout.ps1"
+      - "test_auth_passkey_audit.ps1"
       - ".github/workflows/media-ci.yml"
   pull_request:
     paths:
@@ -22,6 +23,7 @@ on:
       - "test_auth_passkey_persistence.ps1"
       - "test_auth_passkey_rate_limit.ps1"
       - "test_auth_passkey_lockout.ps1"
+      - "test_auth_passkey_audit.ps1"
       - ".github/workflows/media-ci.yml"
   workflow_dispatch:
 
@@ -525,6 +527,39 @@ jobs:
           if created.get("tenantId") != tenant:
             raise RuntimeError("passkey jwt tenant enforcement failed")
 
+          # Cross-tenant credential reuse must fail.
+          ch_cross = post("/api/auth/passkey/challenge", {
+            "username": username,
+            "flow": "login",
+            "tenantId": "tenant-other",
+            "rpId": rp_id,
+            "origin": origin
+          })
+          cross_client_data = json.dumps({
+            "type": "webauthn.get",
+            "challenge": ch_cross["challenge"],
+            "origin": origin
+          }, separators=(",", ":"))
+          cross_auth = build_auth_data(rp_id, 3)
+          try:
+            post("/api/auth/passkey/login", {
+              "username": username,
+              "challengeId": ch_cross["challengeId"],
+              "challenge": ch_cross["challenge"],
+              "credentialId": credential_id,
+              "signCount": 3,
+              "rpId": rp_id,
+              "origin": origin,
+              "clientDataType": "webauthn.get",
+              "clientDataJSON": b64url(cross_client_data.encode("utf-8")),
+              "authenticatorData": cross_auth,
+              "signature": build_signature("ci-public-key", cross_auth, cross_client_data),
+            })
+            raise RuntimeError("cross-tenant credential reuse was not blocked")
+          except urllib.error.HTTPError as e:
+            if e.code != 401:
+              raise
+
           bad_ch = post("/api/auth/passkey/challenge", {
             "username": username,
             "flow": "login",
@@ -615,6 +650,19 @@ jobs:
           except urllib.error.HTTPError as e:
             if e.code != 401:
               raise
+
+          # Audit log should contain passkey events.
+          audit_path = "data/auth_audit.jsonl"
+          try:
+            with open(audit_path, "r", encoding="utf-8") as f:
+              lines = [line.strip() for line in f if line.strip()]
+          except FileNotFoundError:
+            raise RuntimeError("auth audit file is missing")
+          events = [json.loads(line) for line in lines]
+          event_types = {e.get("eventType") for e in events}
+          for required in ("passkey.challenge", "passkey.register", "passkey.login"):
+            if required not in event_types:
+              raise RuntimeError(f"missing audit event type: {required}")
 
           print("PASS: passkey phase-1 auth flow")
           PY
