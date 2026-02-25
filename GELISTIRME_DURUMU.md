@@ -54,9 +54,9 @@
 - [+] Realtime Core: Passkey tam WebAuthn COSE public-key (ECDSA/EdDSA) signature verification (production hardening).
 - [+] Realtime Core: Passkey EdDSA (alg=-8 / Ed25519) production rollout localde dogrulandi (Windows + libsodium.dll ile canli entegrasyon testi PASS).
 
-- [-] Media Plane: 2-10 kisi icin P2P WebRTC akisi.
+- [+] Media Plane: 2-10 kisi icin P2P WebRTC signaling mesh akisi eklendi (WS peer list + hedefli signal relay).
 - [-] Media Plane: 10+ icin SFU fallback (LiveKit veya mediasoup).
-- [-] Media Plane: Oda boyutuna gore otomatik route/policy engine.
+- [+] Media Plane: Oda boyutuna gore otomatik route/policy engine eklendi (p2p/sfu mode flag, threshold env ile).
 
 - [-] Federation: Matrix'in control-plane olarak baglanmasi.
 - [-] Federation: Room/identity/bridge adapter katmaninin eklenmesi.
@@ -106,6 +106,10 @@
 - [+] test_auth_passkey_es256.ps1 eklendi ve PASS alindi (ES256 COSE register/login + invalid signature bloklama).
 - [+] setup_libsodium_windows.ps1 eklendi (Windows icin libsodium.dll hizli kurulum scripti).
 - [+] test_auth_passkey_eddsa.ps1 eklendi ve PASS alindi (Ed25519 COSE register/login + invalid signature bloklama).
+- [+] WebSocket media peer orchestration eklendi (`media.peer.list`, `media.peer.joined`, `media.peer.left`, `media.peer.sync`).
+- [+] WebSocket hedefli WebRTC signal relay eklendi (`webrtc.signal` + `webrtc.signal.ack`, room+tenant scoped).
+- [+] /api/health icine media routing policy bilgisi eklendi (`mediaRouting.p2pThreshold`, policy aciklamasi).
+- [+] test_media_p2p_policy.ps1 eklendi ve PASS alindi (p2p->sfu mode gecisi + signal relay/ack).
 
 
 

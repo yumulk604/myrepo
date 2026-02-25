@@ -3559,6 +3559,62 @@ void removeWebSocketClient(int socket) {
     );
 }
 
+int mediaP2PMaxPeers() {
+    static const int maxPeers = getEnvIntWithFallback("GIGACHAD_MEDIA_P2P_MAX_PEERS", "MEDIA_P2P_MAX_PEERS", 10);
+    return maxPeers > 1 ? maxPeers : 10;
+}
+
+std::vector<std::string> collectRoomPeerUserIds(const std::string& roomId, const std::string& tenantId) {
+    std::vector<WebSocketClient> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(ws_mutex);
+        snapshot = wsClients;
+    }
+    std::unordered_set<std::string> seen;
+    std::vector<std::string> users;
+    const std::string normalizedTenant = normalizeTenantId(tenantId);
+    for (const auto& c : snapshot) {
+        if (normalizeTenantId(c.tenantId) != normalizedTenant) continue;
+        if (!roomId.empty() && !c.roomId.empty() && c.roomId != roomId) continue;
+        if (c.userId.empty()) continue;
+        if (seen.insert(c.userId).second) {
+            users.push_back(c.userId);
+        }
+    }
+    std::sort(users.begin(), users.end());
+    return users;
+}
+
+std::string jsonStringArray(const std::vector<std::string>& values) {
+    std::stringstream ss;
+    ss << "[";
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) ss << ",";
+        ss << "\"" << escapeJSONString(values[i]) << "\"";
+    }
+    ss << "]";
+    return ss.str();
+}
+
+std::string mediaModeForRoomSize(size_t uniquePeerCountInRoom) {
+    return uniquePeerCountInRoom <= static_cast<size_t>(mediaP2PMaxPeers()) ? "p2p" : "sfu";
+}
+
+std::string buildRoomPolicyPayloadJson(const std::string& roomId, const std::string& tenantId) {
+    const auto peers = collectRoomPeerUserIds(roomId, tenantId);
+    const std::string mode = mediaModeForRoomSize(peers.size());
+    std::stringstream ss;
+    ss << "{"
+       << "\"roomId\":\"" << escapeJSONString(roomId) << "\","
+       << "\"tenantId\":\"" << escapeJSONString(normalizeTenantId(tenantId)) << "\","
+       << "\"peers\":" << jsonStringArray(peers) << ","
+       << "\"roomSize\":" << peers.size() << ","
+       << "\"p2pThreshold\":" << mediaP2PMaxPeers() << ","
+       << "\"mediaMode\":\"" << mode << "\""
+       << "}";
+    return ss.str();
+}
+
 std::string buildEventFramePayload(const std::string& type, const std::string& payloadJson, const std::string& roomId = "", const std::string& tenantId = "default") {
     std::stringstream ss;
     ss << "{"
@@ -3569,6 +3625,47 @@ std::string buildEventFramePayload(const std::string& type, const std::string& p
        << "\"payload\":" << (payloadJson.empty() ? "{}" : payloadJson)
        << "}";
     return ss.str();
+}
+
+size_t sendEventToUserLocal(
+    const std::string& type,
+    const std::string& payloadJson,
+    const std::string& roomId,
+    const std::string& tenantId,
+    const std::string& targetUserId
+) {
+    if (targetUserId.empty()) return 0;
+    const std::string framePayload = buildEventFramePayload(type, payloadJson, roomId, tenantId);
+    std::vector<WebSocketClient> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(ws_mutex);
+        snapshot = wsClients;
+    }
+
+    const std::string normalizedTenant = normalizeTenantId(tenantId);
+    std::vector<int> deadSockets;
+    size_t delivered = 0;
+    for (const auto& client : snapshot) {
+        if (client.userId != targetUserId) continue;
+        if (normalizeTenantId(client.tenantId) != normalizedTenant) continue;
+        if (!roomId.empty() && !client.roomId.empty() && client.roomId != roomId) continue;
+        if (!sendWebSocketFrame(client.socket, 0x1, framePayload)) {
+            deadSockets.push_back(client.socket);
+            continue;
+        }
+        ++delivered;
+    }
+
+    if (!deadSockets.empty()) {
+        std::lock_guard<std::mutex> lock(ws_mutex);
+        wsClients.erase(
+            std::remove_if(wsClients.begin(), wsClients.end(), [&deadSockets](const WebSocketClient& c) {
+                return std::find(deadSockets.begin(), deadSockets.end(), c.socket) != deadSockets.end();
+            }),
+            wsClients.end()
+        );
+    }
+    return delivered;
 }
 
 void broadcastFrameLocal(const std::string& framePayload, const std::string& roomId = "", const std::string& tenantId = "default") {
@@ -5175,6 +5272,8 @@ void handleWebSocketClient(int clientSocket, const HTTPRequest& req, const std::
         std::lock_guard<std::mutex> lock(ws_mutex);
         wsClients.push_back(client);
     }
+    const std::string roomPolicyPayload = buildRoomPolicyPayloadJson(client.roomId, client.tenantId);
+    const std::string roomMediaMode = extractJSONValue(roomPolicyPayload, "mediaMode");
 
     broadcastEvent(
         "presence.joined",
@@ -5182,11 +5281,17 @@ void handleWebSocketClient(int clientSocket, const HTTPRequest& req, const std::
         client.roomId,
         client.tenantId
     );
+    broadcastEvent("media.peer.joined", roomPolicyPayload, client.roomId, client.tenantId);
+    if (!sendWebSocketFrame(clientSocket, 0x1, buildEventFramePayload("media.peer.list", roomPolicyPayload, client.roomId, client.tenantId))) {
+        removeWebSocketClient(clientSocket);
+        closeClientSocket(clientSocket);
+        return;
+    }
 
     sendWebSocketFrame(
         clientSocket,
         0x1,
-        "{\"type\":\"connected\",\"roomId\":\"" + escapeJSONString(client.roomId) + "\",\"tenantId\":\"" + escapeJSONString(client.tenantId) + "\",\"timestamp\":\"" + escapeJSONString(getCurrentTimestamp()) + "\"}"
+        "{\"type\":\"connected\",\"roomId\":\"" + escapeJSONString(client.roomId) + "\",\"tenantId\":\"" + escapeJSONString(client.tenantId) + "\",\"mediaMode\":\"" + escapeJSONString(roomMediaMode) + "\",\"timestamp\":\"" + escapeJSONString(getCurrentTimestamp()) + "\"}"
     );
 
     while (true) {
@@ -5209,6 +5314,71 @@ void handleWebSocketClient(int clientSocket, const HTTPRequest& req, const std::
             if (!sendWebSocketFrame(clientSocket, 0x1, "{\"type\":\"pong\"}")) {
                 break;
             }
+            continue;
+        }
+        if (opcode != 0x1) {
+            continue;
+        }
+
+        const std::string frameType = trimWhitespace(extractJSONValue(payload, "type"));
+        if (frameType == "media.peer.sync") {
+            const std::string syncPayload = buildRoomPolicyPayloadJson(client.roomId, client.tenantId);
+            if (!sendWebSocketFrame(clientSocket, 0x1, buildEventFramePayload("media.peer.list", syncPayload, client.roomId, client.tenantId))) {
+                break;
+            }
+            continue;
+        }
+        if (frameType == "webrtc.signal") {
+            std::string targetUser = trimWhitespace(extractJSONValue(payload, "targetUser"));
+            if (targetUser.empty()) targetUser = trimWhitespace(extractJSONValue(payload, "target"));
+            const std::string signalType = trimWhitespace(extractJSONValue(payload, "signalType"));
+            const std::string sdp = extractJSONValue(payload, "sdp");
+            const std::string candidate = extractJSONValue(payload, "candidate");
+            const std::string data = extractJSONValue(payload, "data");
+            const std::string requestedRoom = trimWhitespace(extractJSONValue(payload, "roomId"));
+            const std::string requestedTenantRaw = trimWhitespace(extractJSONValue(payload, "tenantId"));
+            const std::string requestedTenant = requestedTenantRaw.empty() ? client.tenantId : normalizeTenantId(requestedTenantRaw);
+            const std::string effectiveRoom = requestedRoom.empty() ? client.roomId : requestedRoom;
+            const std::string effectiveTenant = normalizeTenantId(client.tenantId);
+
+            if (targetUser.empty()) {
+                if (!sendWebSocketFrame(clientSocket, 0x1, "{\"type\":\"error\",\"code\":\"missing_target\",\"message\":\"webrtc.signal requires targetUser\"}")) {
+                    break;
+                }
+                continue;
+            }
+            if (!effectiveRoom.empty() && !client.roomId.empty() && effectiveRoom != client.roomId) {
+                if (!sendWebSocketFrame(clientSocket, 0x1, "{\"type\":\"error\",\"code\":\"room_mismatch\",\"message\":\"WebRTC signaling room mismatch\"}")) {
+                    break;
+                }
+                continue;
+            }
+            if (normalizeTenantId(requestedTenant) != effectiveTenant) {
+                if (!sendWebSocketFrame(clientSocket, 0x1, "{\"type\":\"error\",\"code\":\"tenant_mismatch\",\"message\":\"WebRTC signaling tenant mismatch\"}")) {
+                    break;
+                }
+                continue;
+            }
+
+            std::stringstream relayPayload;
+            relayPayload << "{"
+                         << "\"from\":\"" << escapeJSONString(client.userId) << "\","
+                         << "\"to\":\"" << escapeJSONString(targetUser) << "\","
+                         << "\"signalType\":\"" << escapeJSONString(signalType) << "\","
+                         << "\"sdp\":\"" << escapeJSONString(sdp) << "\","
+                         << "\"candidate\":\"" << escapeJSONString(candidate) << "\","
+                         << "\"data\":\"" << escapeJSONString(data) << "\""
+                         << "}";
+            const size_t delivered = sendEventToUserLocal("webrtc.signal", relayPayload.str(), effectiveRoom, effectiveTenant, targetUser);
+            if (delivered == 0) {
+                if (!sendWebSocketFrame(clientSocket, 0x1, "{\"type\":\"error\",\"code\":\"target_not_found\",\"message\":\"WebRTC signaling target is offline\"}")) {
+                    break;
+                }
+                continue;
+            }
+            if (!sendWebSocketFrame(clientSocket, 0x1, "{\"type\":\"webrtc.signal.ack\",\"targetUser\":\"" + escapeJSONString(targetUser) + "\"}")) {
+                break;
+            }
         }
     }
 
@@ -5219,6 +5389,8 @@ void handleWebSocketClient(int clientSocket, const HTTPRequest& req, const std::
         client.roomId,
         client.tenantId
     );
+    const std::string roomPolicyAfterLeave = buildRoomPolicyPayloadJson(client.roomId, client.tenantId);
+    broadcastEvent("media.peer.left", roomPolicyAfterLeave, client.roomId, client.tenantId);
     closeClientSocket(clientSocket);
 }
 
@@ -5329,7 +5501,10 @@ HTTPResponse handleRequest(const HTTPRequest& req) {
       "Auth audit log": "data/auth_audit.jsonl"
     },
     "Realtime": {
-      "GET /ws?room={roomId}&user={userId}&tenant={tenantId}&token={token}": "WebSocket event stream"
+      "GET /ws?room={roomId}&user={userId}&tenant={tenantId}&token={token}": "WebSocket event stream",
+      "WS message type webrtc.signal": "Direct room+tenant scoped offer/answer/ice relay to targetUser",
+      "WS message type media.peer.sync": "Request current room peers + routing mode snapshot",
+      "Media routing env": "GIGACHAD_MEDIA_P2P_MAX_PEERS or MEDIA_P2P_MAX_PEERS"
     }
   }
 })JSON";
@@ -5351,6 +5526,10 @@ HTTPResponse handleRequest(const HTTPRequest& req) {
            << "\"timestamp\":\"" << getCurrentTimestamp() << "\","
            << "\"eventBusMode\":\"" << eventBusMode << "\","
            << "\"eventBusRedisReady\":" << (g_eventBusRedisReady.load() ? "true" : "false") << ","
+           << "\"mediaRouting\":{"
+           << "\"p2pThreshold\":" << mediaP2PMaxPeers() << ","
+           << "\"policy\":\"p2p_if_room_size_lte_threshold_else_sfu\""
+           << "},"
            << "\"stats\":{"
            << "\"messages\":" << messages.size() << ","
            << "\"activeCalls\":" << callSessions.size() << ","
