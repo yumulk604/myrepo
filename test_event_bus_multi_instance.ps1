@@ -78,7 +78,7 @@ function Wait-ServerReady {
         try {
             $health = Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 2
             $lastHealth = $health
-            if ($health.status -eq "healthy" -and $health.eventBusMode -eq "redis") {
+            if ($health.status -eq "healthy" -and $health.eventBusMode -eq "redis" -and $health.eventBusRedisReady -eq $true) {
                 return $true
             }
         } catch {
@@ -104,13 +104,14 @@ function Receive-WebSocketText {
     $builder = [System.Text.StringBuilder]::new()
 
     while ($true) {
-        $cts = [System.Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds($ReceiveTimeoutSec))
+        $task = $Socket.ReceiveAsync($segment, [System.Threading.CancellationToken]::None)
+        if (-not $task.Wait([TimeSpan]::FromSeconds($ReceiveTimeoutSec))) {
+            return "__timeout__"
+        }
         try {
-            $result = $Socket.ReceiveAsync($segment, $cts.Token).GetAwaiter().GetResult()
+            $result = $task.GetAwaiter().GetResult()
         } catch {
             return $null
-        } finally {
-            $cts.Dispose()
         }
 
         if ($result.MessageType -eq [System.Net.WebSockets.WebSocketMessageType]::Close) {
@@ -177,6 +178,9 @@ try {
     $received = $false
     while ((Get-Date) -lt $deadline) {
         $frame = Receive-WebSocketText -Socket $ws -ReceiveTimeoutSec 5
+        if ($frame -eq "__timeout__") {
+            continue
+        }
         if ([string]::IsNullOrWhiteSpace($frame)) {
             continue
         }

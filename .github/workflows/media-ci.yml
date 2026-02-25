@@ -84,7 +84,7 @@ jobs:
                   body = r.read().decode("utf-8")
                 data = json.loads(body)
                 last = data
-                if data.get("status") == "healthy" and data.get("eventBusMode") == "redis":
+                if data.get("status") == "healthy" and data.get("eventBusMode") == "redis" and data.get("eventBusRedisReady") is True:
                   return
               except Exception:
                 pass
@@ -139,6 +139,115 @@ jobs:
             ws.close()
           PY
 
+      - name: Run multi-tenant isolation test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup() {
+            if [[ -n "${PID_A:-}" ]]; then kill "$PID_A" 2>/dev/null || true; fi
+            if [[ -n "${PID_B:-}" ]]; then kill "$PID_B" 2>/dev/null || true; fi
+          }
+          trap cleanup EXIT
+
+          export GIGACHAD_EVENT_BUS=redis
+          export GIGACHAD_REDIS_HOST=127.0.0.1
+          export GIGACHAD_REDIS_PORT=6379
+          export GIGACHAD_EVENT_BUS_CHANNEL=gagabunto.media.ci.tenant.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}
+          export GIGACHAD_API_TOKEN=
+          export GIGACHAD_WS_TOKEN=
+
+          GIGACHAD_SERVER_PORT=18181 ./media_server >tenant_a.log 2>&1 &
+          PID_A=$!
+          GIGACHAD_SERVER_PORT=18182 ./media_server >tenant_b.log 2>&1 &
+          PID_B=$!
+
+          python - <<'PY'
+          import json
+          import time
+          import urllib.request
+          from websocket import create_connection, WebSocketTimeoutException
+
+          def wait_health(port, timeout=25):
+            end = time.time() + timeout
+            url = f"http://127.0.0.1:{port}/api/health"
+            while time.time() < end:
+              try:
+                with urllib.request.urlopen(url, timeout=2) as r:
+                  data = json.loads(r.read().decode("utf-8"))
+                if data.get("status") == "healthy" and data.get("eventBusMode") == "redis" and data.get("eventBusRedisReady") is True:
+                  return
+              except Exception:
+                pass
+              time.sleep(0.5)
+            raise RuntimeError(f"health timeout on {port}")
+
+          wait_health(18181)
+          wait_health(18182)
+
+          room = "tenant-room"
+          tenant_a = "tenant-alpha"
+          tenant_b = "tenant-beta"
+
+          ws = create_connection(f"ws://127.0.0.1:18182/ws?room={room}&user=ci-tenant-listener&tenant={tenant_b}", timeout=5)
+          ws.settimeout(1.5)
+          try:
+            try:
+              ws.recv()
+            except Exception:
+              pass
+
+            marker_a = f"tenantA-{int(time.time()*1000)}"
+            body_a = json.dumps({"username":"ci","content":marker_a,"roomId":room,"tenantId":tenant_a}).encode("utf-8")
+            req_a = urllib.request.Request(
+              "http://127.0.0.1:18181/api/chat/messages",
+              data=body_a,
+              method="POST",
+              headers={"Content-Type":"application/json"},
+            )
+            urllib.request.urlopen(req_a, timeout=5).read()
+
+            unexpected = False
+            end = time.time() + 5
+            while time.time() < end:
+              try:
+                frame = ws.recv()
+              except WebSocketTimeoutException:
+                continue
+              ev = json.loads(frame)
+              if ev.get("type") == "chat.message.created" and (ev.get("payload") or {}).get("content") == marker_a:
+                unexpected = True
+                break
+            if unexpected:
+              raise RuntimeError("tenant isolation failed: different tenant event received")
+
+            marker_b = f"tenantB-{int(time.time()*1000)}"
+            body_b = json.dumps({"username":"ci","content":marker_b,"roomId":room,"tenantId":tenant_b}).encode("utf-8")
+            req_b = urllib.request.Request(
+              "http://127.0.0.1:18181/api/chat/messages",
+              data=body_b,
+              method="POST",
+              headers={"Content-Type":"application/json"},
+            )
+            urllib.request.urlopen(req_b, timeout=5).read()
+
+            received = False
+            end = time.time() + 15
+            while time.time() < end:
+              try:
+                frame = ws.recv()
+              except WebSocketTimeoutException:
+                continue
+              ev = json.loads(frame)
+              if ev.get("type") == "chat.message.created" and ev.get("tenantId") == tenant_b and (ev.get("payload") or {}).get("content") == marker_b:
+                received = True
+                break
+            if not received:
+              raise RuntimeError("tenant delivery failed: same tenant event missing")
+            print("PASS: multi-tenant isolation test")
+          finally:
+            ws.close()
+          PY
+
       - name: Dump logs on failure
         if: failure()
         run: |
@@ -146,3 +255,7 @@ jobs:
           cat server_a.log || true
           echo "----- server_b.log -----"
           cat server_b.log || true
+          echo "----- tenant_a.log -----"
+          cat tenant_a.log || true
+          echo "----- tenant_b.log -----"
+          cat tenant_b.log || true

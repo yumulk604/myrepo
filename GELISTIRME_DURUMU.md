@@ -32,7 +32,10 @@
 - [+] Realtime Core: Event bus Redis transport (gercek pub/sub) entegrasyonu.
 - [+] Realtime Core: Multi-instance Redis event bus test/otomasyon senaryosu (PowerShell) eklendi.
 - [+] Realtime Core: Multi-instance test CI pipeline'a baglandi (GitHub Actions + Redis service).
-- [-] Realtime Core: Auth temelinin (passkey/JWT) kurulmasi.
+- [+] Realtime Core: Multi-tenant instance Redis event bus test/otomasyon eklendi (tenant izolasyonu + tenant delivery).
+- [+] Realtime Core: Multi-tenant instance test CI pipeline'a baglandi.
+- [+] Realtime Core: JWT auth temeli kuruldu (login/refresh/logout + access/refresh token + revoke).
+- [-] Realtime Core: Passkey onboarding + JWT ile birlesik auth akisi.
 
 - [-] Media Plane: 2-10 kisi icin P2P WebRTC akisi.
 - [-] Media Plane: 10+ icin SFU fallback (LiveKit veya mediasoup).
@@ -58,6 +61,11 @@
 - [+] test_event_bus_multi_instance.ps1 eklendi (2 instance + Redis + WS event propagation testi)
 - [+] Multi-instance Redis testi localde dogrulandi (Docker Redis + script PASS)
 - [+] .github/workflows/media-ci.yml eklendi (build + 2 instance + Redis + websocket propagation testi)
+- [+] Multi-tenant chat izolasyonu eklendi (tenantId: API + WS + event frame + Redis subscriber filtreleme)
+- [+] test_event_bus_multi_tenant.ps1 eklendi ve localde PASS alindi
+- [+] JWT claim tabanli role/tenant enforcement eklendi (HTTP API + WebSocket)
+- [+] /api/auth/login, /api/auth/refresh, /api/auth/logout endpointleri eklendi
+- [+] test_auth.ps1 eklendi ve localde PASS alindi (login/refresh/logout + tenant claim enforcement)
 
 
 

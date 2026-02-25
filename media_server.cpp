@@ -36,6 +36,7 @@
 #include <cstring>
 #include <deque>
 #include <unordered_map>
+#include <unordered_set>
 #include <atomic>
 #include <cstdio>
 #include <cerrno>
@@ -55,13 +56,15 @@ struct Message {
     std::string content;
     std::string timestamp;
     std::string roomId;
+    std::string tenantId;
     
     std::string toJSON() const {
         return "{\"id\":\"" + escapeJSON(id) + 
                "\",\"username\":\"" + escapeJSON(username) + 
                "\",\"content\":\"" + escapeJSON(content) + 
                "\",\"timestamp\":\"" + escapeJSON(timestamp) + 
-               "\",\"roomId\":\"" + escapeJSON(roomId) + "\"}";
+               "\",\"roomId\":\"" + escapeJSON(roomId) +
+               "\",\"tenantId\":\"" + escapeJSON(tenantId) + "\"}";
     }
     
 private:
@@ -204,6 +207,7 @@ struct WebSocketClient {
     int socket;
     std::string roomId;
     std::string userId;
+    std::string tenantId;
 };
 
 std::vector<WebSocketClient> wsClients;
@@ -263,6 +267,19 @@ std::string detectEventBusMode() {
 bool eventBusModeIsRedis() {
     static const std::string mode = detectEventBusMode();
     return mode == "redis";
+}
+
+bool eventBusDebugEnabled() {
+    static const bool enabled = []() {
+        const char* primary = std::getenv("GIGACHAD_EVENT_BUS_DEBUG");
+        const char* fallback = std::getenv("MEDIA_EVENT_BUS_DEBUG");
+        std::string raw = primary && *primary ? primary : (fallback && *fallback ? fallback : "");
+        std::transform(raw.begin(), raw.end(), raw.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return raw == "1" || raw == "true" || raw == "yes";
+    }();
+    return enabled;
 }
 
 std::string detectRedisHost() {
@@ -392,6 +409,9 @@ std::atomic<bool> g_eventBusRedisWarned{false};
 std::atomic<bool> g_eventBusRedisStarted{false};
 std::atomic<bool> g_eventBusRedisReady{false};
 std::atomic<bool> g_eventBusRedisPublishWarned{false};
+std::unordered_set<std::string> g_revokedRefreshTokenJti;
+std::unordered_set<std::string> g_revokedAccessTokenJti;
+std::mutex g_auth_mutex;
 
 // ============================================================================
 // UTILITY FUNCTIONS
@@ -441,6 +461,21 @@ std::string extractJSONValue(const std::string& json, const std::string& key) {
     if (endPos == std::string::npos) return "";
     
     return json.substr(pos, endPos - pos);
+}
+
+std::string normalizeTenantId(const std::string& rawTenant) {
+    std::string tenant = rawTenant;
+    auto isWs = [](unsigned char c) { return std::isspace(c) != 0; };
+    while (!tenant.empty() && isWs(static_cast<unsigned char>(tenant.front()))) {
+        tenant.erase(tenant.begin());
+    }
+    while (!tenant.empty() && isWs(static_cast<unsigned char>(tenant.back()))) {
+        tenant.pop_back();
+    }
+    if (tenant.empty()) {
+        return "default";
+    }
+    return tenant;
 }
 
 bool hasJSONKey(const std::string& json, const std::string& key) {
@@ -589,7 +624,8 @@ bool initSqliteStorage() {
         "username TEXT,"
         "content TEXT,"
         "timestamp TEXT,"
-        "roomId TEXT"
+        "roomId TEXT,"
+        "tenantId TEXT DEFAULT 'default'"
         ");";
     const std::string createCallsSql =
         "CREATE TABLE IF NOT EXISTS call_sessions ("
@@ -637,6 +673,9 @@ bool initSqliteStorage() {
               sqliteExec(db, createCallsSql) &&
               sqliteExec(db, createStreamsSql) &&
               sqliteExec(db, createRecordingsSql);
+    if (ok) {
+        sqliteExec(db, "ALTER TABLE messages ADD COLUMN tenantId TEXT DEFAULT 'default';");
+    }
     p_sqlite3_close(db);
     g_sqliteReady = ok;
     return ok;
@@ -664,7 +703,7 @@ bool persistMessagesToSqliteUnlocked() {
         return false;
     }
 
-    const char* insertSql = "INSERT INTO messages(id, username, content, timestamp, roomId) VALUES(?, ?, ?, ?, ?);";
+    const char* insertSql = "INSERT INTO messages(id, username, content, timestamp, roomId, tenantId) VALUES(?, ?, ?, ?, ?, ?);";
     sqlite3_stmt* stmt = nullptr;
     if (p_sqlite3_prepare_v2(db, insertSql, -1, &stmt, nullptr) != SQLITE_OK || stmt == nullptr) {
         sqliteExec(db, "ROLLBACK;");
@@ -679,7 +718,8 @@ bool persistMessagesToSqliteUnlocked() {
             p_sqlite3_bind_text(stmt, 2, msg.username.c_str(), -1, transient) != SQLITE_OK ||
             p_sqlite3_bind_text(stmt, 3, msg.content.c_str(), -1, transient) != SQLITE_OK ||
             p_sqlite3_bind_text(stmt, 4, msg.timestamp.c_str(), -1, transient) != SQLITE_OK ||
-            p_sqlite3_bind_text(stmt, 5, msg.roomId.c_str(), -1, transient) != SQLITE_OK) {
+            p_sqlite3_bind_text(stmt, 5, msg.roomId.c_str(), -1, transient) != SQLITE_OK ||
+            p_sqlite3_bind_text(stmt, 6, msg.tenantId.c_str(), -1, transient) != SQLITE_OK) {
             ok = false;
             break;
         }
@@ -714,7 +754,7 @@ bool loadMessagesFromSqlite() {
         return false;
     }
 
-    const char* querySql = "SELECT id, username, content, timestamp, roomId FROM messages ORDER BY rowid ASC;";
+    const char* querySql = "SELECT id, username, content, timestamp, roomId, COALESCE(tenantId, 'default') FROM messages ORDER BY rowid ASC;";
     sqlite3_stmt* stmt = nullptr;
     if (p_sqlite3_prepare_v2(db, querySql, -1, &stmt, nullptr) != SQLITE_OK || stmt == nullptr) {
         p_sqlite3_close(db);
@@ -739,11 +779,13 @@ bool loadMessagesFromSqlite() {
         const unsigned char* c2 = p_sqlite3_column_text(stmt, 2);
         const unsigned char* c3 = p_sqlite3_column_text(stmt, 3);
         const unsigned char* c4 = p_sqlite3_column_text(stmt, 4);
+        const unsigned char* c5 = p_sqlite3_column_text(stmt, 5);
         msg.id = c0 ? reinterpret_cast<const char*>(c0) : "";
         msg.username = c1 ? reinterpret_cast<const char*>(c1) : "";
         msg.content = c2 ? reinterpret_cast<const char*>(c2) : "";
         msg.timestamp = c3 ? reinterpret_cast<const char*>(c3) : "";
         msg.roomId = c4 ? reinterpret_cast<const char*>(c4) : "";
+        msg.tenantId = normalizeTenantId(c5 ? reinterpret_cast<const char*>(c5) : "");
         if (!msg.id.empty()) {
             messages.push_back(msg);
         }
@@ -1180,6 +1222,7 @@ void loadMessagesFromDisk() {
                 msg.content = extractJSONValue(line, "content");
                 msg.timestamp = extractJSONValue(line, "timestamp");
                 msg.roomId = extractJSONValue(line, "roomId");
+                msg.tenantId = normalizeTenantId(extractJSONValue(line, "tenantId"));
                 if (!msg.id.empty()) {
                     messages.push_back(msg);
                 }
@@ -1204,6 +1247,7 @@ void loadMessagesFromDisk() {
         msg.content = extractJSONValue(line, "content");
         msg.timestamp = extractJSONValue(line, "timestamp");
         msg.roomId = extractJSONValue(line, "roomId");
+        msg.tenantId = normalizeTenantId(extractJSONValue(line, "tenantId"));
         if (!msg.id.empty()) {
             messages.push_back(msg);
         }
@@ -1438,6 +1482,256 @@ std::string extractBearerToken(const std::string& authHeader) {
         return "";
     }
     return authHeader.substr(prefix.size());
+}
+
+std::string base64Encode(const uint8_t* data, size_t len);
+std::string escapeJSONString(const std::string& s);
+
+struct AuthContext {
+    bool valid = false;
+    std::string tokenType; // access or refresh
+    std::string subject;
+    std::string role;
+    std::string tenantId;
+    std::string jti;
+    int exp = 0;
+};
+
+std::string trimWhitespace(const std::string& input) {
+    std::string out = input;
+    auto isWs = [](unsigned char c) { return std::isspace(c) != 0; };
+    while (!out.empty() && isWs(static_cast<unsigned char>(out.front()))) out.erase(out.begin());
+    while (!out.empty() && isWs(static_cast<unsigned char>(out.back()))) out.pop_back();
+    return out;
+}
+
+bool jwtEnabled() {
+    static const std::string secret = trimWhitespace(getEnvStringWithFallback("GIGACHAD_JWT_SECRET", "MEDIA_JWT_SECRET", ""));
+    return !secret.empty();
+}
+
+std::string jwtSecret() {
+    static const std::string secret = trimWhitespace(getEnvStringWithFallback("GIGACHAD_JWT_SECRET", "MEDIA_JWT_SECRET", ""));
+    return secret;
+}
+
+int jwtAccessTtlSec() {
+    static const int ttl = getEnvIntWithFallback("GIGACHAD_JWT_ACCESS_TTL_SEC", "MEDIA_JWT_ACCESS_TTL_SEC", 900);
+    return ttl > 0 ? ttl : 900;
+}
+
+int jwtRefreshTtlSec() {
+    static const int ttl = getEnvIntWithFallback("GIGACHAD_JWT_REFRESH_TTL_SEC", "MEDIA_JWT_REFRESH_TTL_SEC", 604800);
+    return ttl > 0 ? ttl : 604800;
+}
+
+std::string base64UrlFromBase64(std::string b64) {
+    for (char& c : b64) {
+        if (c == '+') c = '-';
+        else if (c == '/') c = '_';
+    }
+    while (!b64.empty() && b64.back() == '=') b64.pop_back();
+    return b64;
+}
+
+std::string base64UrlEncode(const uint8_t* data, size_t len) {
+    return base64UrlFromBase64(base64Encode(data, len));
+}
+
+int base64Value(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+std::string base64UrlDecodeToString(std::string in) {
+    for (char& c : in) {
+        if (c == '-') c = '+';
+        else if (c == '_') c = '/';
+    }
+    while ((in.size() % 4) != 0) in.push_back('=');
+
+    std::string out;
+    out.reserve((in.size() / 4) * 3);
+    for (size_t i = 0; i + 3 < in.size(); i += 4) {
+        int v0 = base64Value(in[i]);
+        int v1 = base64Value(in[i + 1]);
+        int v2 = (in[i + 2] == '=') ? 0 : base64Value(in[i + 2]);
+        int v3 = (in[i + 3] == '=') ? 0 : base64Value(in[i + 3]);
+        if (v0 < 0 || v1 < 0 || (in[i + 2] != '=' && v2 < 0) || (in[i + 3] != '=' && v3 < 0)) {
+            return "";
+        }
+        uint32_t triple = (static_cast<uint32_t>(v0) << 18) |
+                          (static_cast<uint32_t>(v1) << 12) |
+                          (static_cast<uint32_t>(v2) << 6) |
+                          static_cast<uint32_t>(v3);
+        out.push_back(static_cast<char>((triple >> 16) & 0xff));
+        if (in[i + 2] != '=') out.push_back(static_cast<char>((triple >> 8) & 0xff));
+        if (in[i + 3] != '=') out.push_back(static_cast<char>(triple & 0xff));
+    }
+    return out;
+}
+
+std::array<uint8_t, 32> sha256(const std::string& input) {
+    static const uint32_t k[64] = {
+        0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+        0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+        0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+        0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+        0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+        0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+        0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+        0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+    };
+    auto rotr = [](uint32_t x, uint32_t n) { return (x >> n) | (x << (32 - n)); };
+
+    std::vector<uint8_t> bytes(input.begin(), input.end());
+    uint64_t bitLen = static_cast<uint64_t>(bytes.size()) * 8;
+    bytes.push_back(0x80);
+    while ((bytes.size() % 64) != 56) bytes.push_back(0x00);
+    for (int i = 7; i >= 0; --i) bytes.push_back(static_cast<uint8_t>((bitLen >> (i * 8)) & 0xff));
+
+    uint32_t h0 = 0x6a09e667, h1 = 0xbb67ae85, h2 = 0x3c6ef372, h3 = 0xa54ff53a;
+    uint32_t h4 = 0x510e527f, h5 = 0x9b05688c, h6 = 0x1f83d9ab, h7 = 0x5be0cd19;
+
+    for (size_t chunk = 0; chunk < bytes.size(); chunk += 64) {
+        uint32_t w[64] = {0};
+        for (int i = 0; i < 16; ++i) {
+            size_t j = chunk + static_cast<size_t>(i * 4);
+            w[i] = (static_cast<uint32_t>(bytes[j]) << 24) |
+                   (static_cast<uint32_t>(bytes[j + 1]) << 16) |
+                   (static_cast<uint32_t>(bytes[j + 2]) << 8) |
+                   static_cast<uint32_t>(bytes[j + 3]);
+        }
+        for (int i = 16; i < 64; ++i) {
+            uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+
+        uint32_t a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
+        for (int i = 0; i < 64; ++i) {
+            uint32_t S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            uint32_t ch = (e & f) ^ ((~e) & g);
+            uint32_t temp1 = h + S1 + ch + k[i] + w[i];
+            uint32_t S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            uint32_t temp2 = S0 + maj;
+            h = g; g = f; f = e; e = d + temp1;
+            d = c; c = b; b = a; a = temp1 + temp2;
+        }
+
+        h0 += a; h1 += b; h2 += c; h3 += d;
+        h4 += e; h5 += f; h6 += g; h7 += h;
+    }
+
+    return {
+        static_cast<uint8_t>((h0 >> 24) & 0xff), static_cast<uint8_t>((h0 >> 16) & 0xff), static_cast<uint8_t>((h0 >> 8) & 0xff), static_cast<uint8_t>(h0 & 0xff),
+        static_cast<uint8_t>((h1 >> 24) & 0xff), static_cast<uint8_t>((h1 >> 16) & 0xff), static_cast<uint8_t>((h1 >> 8) & 0xff), static_cast<uint8_t>(h1 & 0xff),
+        static_cast<uint8_t>((h2 >> 24) & 0xff), static_cast<uint8_t>((h2 >> 16) & 0xff), static_cast<uint8_t>((h2 >> 8) & 0xff), static_cast<uint8_t>(h2 & 0xff),
+        static_cast<uint8_t>((h3 >> 24) & 0xff), static_cast<uint8_t>((h3 >> 16) & 0xff), static_cast<uint8_t>((h3 >> 8) & 0xff), static_cast<uint8_t>(h3 & 0xff),
+        static_cast<uint8_t>((h4 >> 24) & 0xff), static_cast<uint8_t>((h4 >> 16) & 0xff), static_cast<uint8_t>((h4 >> 8) & 0xff), static_cast<uint8_t>(h4 & 0xff),
+        static_cast<uint8_t>((h5 >> 24) & 0xff), static_cast<uint8_t>((h5 >> 16) & 0xff), static_cast<uint8_t>((h5 >> 8) & 0xff), static_cast<uint8_t>(h5 & 0xff),
+        static_cast<uint8_t>((h6 >> 24) & 0xff), static_cast<uint8_t>((h6 >> 16) & 0xff), static_cast<uint8_t>((h6 >> 8) & 0xff), static_cast<uint8_t>(h6 & 0xff),
+        static_cast<uint8_t>((h7 >> 24) & 0xff), static_cast<uint8_t>((h7 >> 16) & 0xff), static_cast<uint8_t>((h7 >> 8) & 0xff), static_cast<uint8_t>(h7 & 0xff)
+    };
+}
+
+std::array<uint8_t, 32> hmacSha256(const std::string& key, const std::string& msg) {
+    std::string k = key;
+    if (k.size() > 64) {
+        auto hashed = sha256(k);
+        k.assign(reinterpret_cast<const char*>(hashed.data()), hashed.size());
+    }
+    if (k.size() < 64) k.append(64 - k.size(), '\0');
+
+    std::string oKeyPad(64, '\0');
+    std::string iKeyPad(64, '\0');
+    for (size_t i = 0; i < 64; ++i) {
+        unsigned char kc = static_cast<unsigned char>(k[i]);
+        oKeyPad[i] = static_cast<char>(kc ^ 0x5c);
+        iKeyPad[i] = static_cast<char>(kc ^ 0x36);
+    }
+    auto inner = sha256(iKeyPad + msg);
+    std::string innerStr(reinterpret_cast<const char*>(inner.data()), inner.size());
+    return sha256(oKeyPad + innerStr);
+}
+
+std::vector<std::string> splitByChar(const std::string& input, char sep) {
+    std::vector<std::string> out;
+    std::stringstream ss(input);
+    std::string part;
+    while (std::getline(ss, part, sep)) out.push_back(part);
+    return out;
+}
+
+int nowEpochSec() {
+    return static_cast<int>(std::time(nullptr));
+}
+
+std::string buildJwtToken(const std::string& tokenType, const std::string& subject, const std::string& role, const std::string& tenantId, int ttlSec) {
+    const int now = nowEpochSec();
+    const int exp = now + ttlSec;
+    const std::string jti = generateId(tokenType + "_");
+    const std::string headerJson = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+    const std::string payloadJson =
+        "{\"sub\":\"" + escapeJSONString(subject) +
+        "\",\"role\":\"" + escapeJSONString(role) +
+        "\",\"tenantId\":\"" + escapeJSONString(normalizeTenantId(tenantId)) +
+        "\",\"type\":\"" + escapeJSONString(tokenType) +
+        "\",\"jti\":\"" + escapeJSONString(jti) +
+        "\",\"iat\":" + std::to_string(now) +
+        ",\"exp\":" + std::to_string(exp) + "}";
+
+    const std::string headerB64 = base64UrlEncode(reinterpret_cast<const uint8_t*>(headerJson.data()), headerJson.size());
+    const std::string payloadB64 = base64UrlEncode(reinterpret_cast<const uint8_t*>(payloadJson.data()), payloadJson.size());
+    const std::string signingInput = headerB64 + "." + payloadB64;
+    const auto sig = hmacSha256(jwtSecret(), signingInput);
+    const std::string sigB64 = base64UrlEncode(sig.data(), sig.size());
+    return signingInput + "." + sigB64;
+}
+
+bool tryParseAndValidateJwt(const std::string& token, AuthContext& outCtx) {
+    outCtx = AuthContext{};
+    if (!jwtEnabled()) return false;
+    auto parts = splitByChar(token, '.');
+    if (parts.size() != 3) return false;
+
+    const std::string signingInput = parts[0] + "." + parts[1];
+    const auto expectedSig = hmacSha256(jwtSecret(), signingInput);
+    const std::string expectedSigB64 = base64UrlEncode(expectedSig.data(), expectedSig.size());
+    if (expectedSigB64 != parts[2]) return false;
+
+    const std::string payloadJson = base64UrlDecodeToString(parts[1]);
+    if (payloadJson.empty()) return false;
+
+    outCtx.subject = extractJSONValue(payloadJson, "sub");
+    outCtx.role = extractJSONValue(payloadJson, "role");
+    outCtx.tenantId = normalizeTenantId(extractJSONValue(payloadJson, "tenantId"));
+    outCtx.tokenType = extractJSONValue(payloadJson, "type");
+    outCtx.jti = extractJSONValue(payloadJson, "jti");
+    outCtx.exp = extractJSONIntValue(payloadJson, "exp", 0);
+
+    if (outCtx.subject.empty() || outCtx.role.empty() || outCtx.tokenType.empty() || outCtx.jti.empty() || outCtx.exp <= 0) {
+        return false;
+    }
+    if (outCtx.exp < nowEpochSec()) return false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_auth_mutex);
+        if (outCtx.tokenType == "refresh" && g_revokedRefreshTokenJti.find(outCtx.jti) != g_revokedRefreshTokenJti.end()) {
+            return false;
+        }
+        if (outCtx.tokenType == "access" && g_revokedAccessTokenJti.find(outCtx.jti) != g_revokedAccessTokenJti.end()) {
+            return false;
+        }
+    }
+
+    outCtx.valid = true;
+    return true;
 }
 
 std::string escapeJSONString(const std::string& s) {
@@ -1915,18 +2209,19 @@ void removeWebSocketClient(int socket) {
     );
 }
 
-std::string buildEventFramePayload(const std::string& type, const std::string& payloadJson, const std::string& roomId = "") {
+std::string buildEventFramePayload(const std::string& type, const std::string& payloadJson, const std::string& roomId = "", const std::string& tenantId = "default") {
     std::stringstream ss;
     ss << "{"
        << "\"type\":\"" << escapeJSONString(type) << "\","
        << "\"roomId\":\"" << escapeJSONString(roomId) << "\","
+       << "\"tenantId\":\"" << escapeJSONString(normalizeTenantId(tenantId)) << "\","
        << "\"timestamp\":\"" << escapeJSONString(getCurrentTimestamp()) << "\","
        << "\"payload\":" << (payloadJson.empty() ? "{}" : payloadJson)
        << "}";
     return ss.str();
 }
 
-void broadcastFrameLocal(const std::string& framePayload, const std::string& roomId = "") {
+void broadcastFrameLocal(const std::string& framePayload, const std::string& roomId = "", const std::string& tenantId = "default") {
     std::vector<WebSocketClient> snapshot;
     {
         std::lock_guard<std::mutex> lock(ws_mutex);
@@ -1935,7 +2230,22 @@ void broadcastFrameLocal(const std::string& framePayload, const std::string& roo
 
     std::vector<int> deadSockets;
     for (const auto& client : snapshot) {
+        const std::string clientTenant = normalizeTenantId(client.tenantId);
+        const std::string eventTenant = normalizeTenantId(tenantId);
+        if (clientTenant != eventTenant) {
+            if (eventBusDebugEnabled()) {
+                std::cerr << "[event-bus-debug] skip socket=" << client.socket
+                          << " reason=tenant-mismatch clientTenant=" << clientTenant
+                          << " eventTenant=" << eventTenant << std::endl;
+            }
+            continue;
+        }
         if (!roomId.empty() && !client.roomId.empty() && client.roomId != roomId) {
+            if (eventBusDebugEnabled()) {
+                std::cerr << "[event-bus-debug] skip socket=" << client.socket
+                          << " reason=room-mismatch clientRoom=" << client.roomId
+                          << " eventRoom=" << roomId << std::endl;
+            }
             continue;
         }
         if (!sendWebSocketFrame(client.socket, 0x1, framePayload)) {
@@ -1954,9 +2264,9 @@ void broadcastFrameLocal(const std::string& framePayload, const std::string& roo
     }
 }
 
-void broadcastEventLocal(const std::string& type, const std::string& payloadJson, const std::string& roomId = "") {
-    const std::string framePayload = buildEventFramePayload(type, payloadJson, roomId);
-    broadcastFrameLocal(framePayload, roomId);
+void broadcastEventLocal(const std::string& type, const std::string& payloadJson, const std::string& roomId = "", const std::string& tenantId = "default") {
+    const std::string framePayload = buildEventFramePayload(type, payloadJson, roomId, tenantId);
+    broadcastFrameLocal(framePayload, roomId, tenantId);
 }
 
 bool publishEventToRedis(const std::string& framePayload) {
@@ -2034,7 +2344,13 @@ void runRedisSubscriberLoop() {
             if (messageParts.size() >= 3 && messageParts[0] == "message") {
                 const std::string& framePayload = messageParts[2];
                 const std::string roomId = extractJSONValue(framePayload, "roomId");
-                broadcastFrameLocal(framePayload, roomId);
+                const std::string tenantId = normalizeTenantId(extractJSONValue(framePayload, "tenantId"));
+                if (eventBusDebugEnabled()) {
+                    std::cerr << "[event-bus-debug] redis message room=" << roomId
+                              << " tenant=" << tenantId
+                              << " type=" << extractJSONValue(framePayload, "type") << std::endl;
+                }
+                broadcastFrameLocal(framePayload, roomId, tenantId);
             }
         }
 
@@ -2056,25 +2372,25 @@ void ensureRedisEventBusThreadStarted() {
     subscriberThread.detach();
 }
 
-void dispatchEvent(const std::string& type, const std::string& payloadJson, const std::string& roomId = "") {
+void dispatchEvent(const std::string& type, const std::string& payloadJson, const std::string& roomId = "", const std::string& tenantId = "default") {
     if (eventBusModeIsRedis()) {
         ensureRedisEventBusThreadStarted();
-        const std::string framePayload = buildEventFramePayload(type, payloadJson, roomId);
+        const std::string framePayload = buildEventFramePayload(type, payloadJson, roomId, tenantId);
         if (publishEventToRedis(framePayload)) {
             return;
         }
         if (!g_eventBusRedisPublishWarned.exchange(true)) {
             std::cerr << "[event-bus] redis publish failed, using local fallback" << std::endl;
         }
-        broadcastFrameLocal(framePayload, roomId);
+        broadcastFrameLocal(framePayload, roomId, tenantId);
         return;
     }
 
-    broadcastEventLocal(type, payloadJson, roomId);
+    broadcastEventLocal(type, payloadJson, roomId, tenantId);
 }
 
-void broadcastEvent(const std::string& type, const std::string& payloadJson, const std::string& roomId = "") {
-    dispatchEvent(type, payloadJson, roomId);
+void broadcastEvent(const std::string& type, const std::string& payloadJson, const std::string& roomId = "", const std::string& tenantId = "default") {
+    dispatchEvent(type, payloadJson, roomId, tenantId);
 }
 
 // ============================================================================
@@ -2111,6 +2427,9 @@ struct HTTPResponse {
         return ss.str();
     }
 };
+
+std::string extractApiTokenFromRequest(const HTTPRequest& req);
+std::string resolveTenantFromRequest(const HTTPRequest& req);
 
 HTTPRequest parseRequest(const std::string& requestStr) {
     HTTPRequest req;
@@ -2158,12 +2477,16 @@ HTTPResponse handleChatAPI(const HTTPRequest& req) {
     // GET /api/chat/messages
     if (req.method == "GET" && routePath == "/api/chat/messages") {
         std::string roomFilter = getQueryParam(req.path, "roomId");
+        const std::string tenantFilter = resolveTenantFromRequest(req);
         std::lock_guard<std::mutex> lock(messages_mutex);
         
         std::stringstream ss;
         ss << "[";
         bool first = true;
         for (const auto& msg : messages) {
+            if (normalizeTenantId(msg.tenantId) != tenantFilter) {
+                continue;
+            }
             if (!roomFilter.empty() && msg.roomId != roomFilter) {
                 continue;
             }
@@ -2196,11 +2519,16 @@ HTTPResponse handleChatAPI(const HTTPRequest& req) {
         if (msg.roomId.empty()) {
             msg.roomId = "global";
         }
+        std::string tenantId = resolveTenantFromRequest(req);
+        if (!jwtEnabled() && tenantId == "default") {
+            tenantId = normalizeTenantId(extractJSONValue(req.body, "tenantId"));
+        }
+        msg.tenantId = normalizeTenantId(tenantId);
         msg.timestamp = getCurrentTimestamp();
         
         messages.push_back(msg);
         persistMessagesToDiskUnlocked();
-        broadcastEvent("chat.message.created", msg.toJSON(), msg.roomId);
+        broadcastEvent("chat.message.created", msg.toJSON(), msg.roomId, msg.tenantId);
         
         res.status = 201;
         res.statusText = "Created";
@@ -2211,6 +2539,119 @@ HTTPResponse handleChatAPI(const HTTPRequest& req) {
     res.status = 404;
     res.statusText = "Not Found";
     res.body = "{\"error\":\"Chat endpoint not found\"}";
+    return res;
+}
+
+HTTPResponse handleAuthAPI(const HTTPRequest& req) {
+    HTTPResponse res;
+    const std::string routePath = getPathOnly(req.path);
+    res.headers["Content-Type"] = "application/json";
+    res.headers["Access-Control-Allow-Origin"] = "*";
+
+    if (!jwtEnabled()) {
+        res.status = 400;
+        res.statusText = "Bad Request";
+        res.body = "{\"error\":\"JWT auth is disabled. Set GIGACHAD_JWT_SECRET or MEDIA_JWT_SECRET.\"}";
+        return res;
+    }
+
+    if (req.method == "POST" && routePath == "/api/auth/login") {
+        const std::string gateToken = trimWhitespace(getEnvStringWithFallback("GIGACHAD_AUTH_LOGIN_TOKEN", "MEDIA_AUTH_LOGIN_TOKEN", ""));
+        if (!gateToken.empty()) {
+            std::string provided = getHeaderValue(req.headers, "X-Login-Token");
+            if (provided.empty()) provided = extractJSONValue(req.body, "loginToken");
+            if (provided != gateToken) {
+                res.status = 401;
+                res.statusText = "Unauthorized";
+                res.body = "{\"error\":\"Invalid login token\"}";
+                return res;
+            }
+        }
+
+        std::string username = extractJSONValue(req.body, "username");
+        if (username.empty()) username = extractJSONValue(req.body, "user");
+        if (username.empty()) {
+            res.status = 400;
+            res.statusText = "Bad Request";
+            res.body = "{\"error\":\"Missing username\"}";
+            return res;
+        }
+
+        std::string role = toLower(trimWhitespace(extractJSONValue(req.body, "role")));
+        if (role != "admin" && role != "moderator" && role != "user") {
+            role = "user";
+        }
+        std::string tenantId = normalizeTenantId(extractJSONValue(req.body, "tenantId"));
+        const std::string accessToken = buildJwtToken("access", username, role, tenantId, jwtAccessTtlSec());
+        const std::string refreshToken = buildJwtToken("refresh", username, role, tenantId, jwtRefreshTtlSec());
+        res.body =
+            "{"
+            "\"tokenType\":\"Bearer\","
+            "\"accessToken\":\"" + escapeJSONString(accessToken) + "\","
+            "\"refreshToken\":\"" + escapeJSONString(refreshToken) + "\","
+            "\"expiresIn\":" + std::to_string(jwtAccessTtlSec()) + ","
+            "\"role\":\"" + escapeJSONString(role) + "\","
+            "\"tenantId\":\"" + escapeJSONString(tenantId) + "\""
+            "}";
+        return res;
+    }
+
+    if (req.method == "POST" && routePath == "/api/auth/refresh") {
+        std::string refreshToken = extractJSONValue(req.body, "refreshToken");
+        if (refreshToken.empty()) {
+            refreshToken = extractBearerToken(getHeaderValue(req.headers, "Authorization"));
+        }
+        AuthContext refreshCtx;
+        if (!tryParseAndValidateJwt(refreshToken, refreshCtx) || refreshCtx.tokenType != "refresh") {
+            res.status = 401;
+            res.statusText = "Unauthorized";
+            res.body = "{\"error\":\"Invalid refresh token\"}";
+            return res;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_auth_mutex);
+            g_revokedRefreshTokenJti.insert(refreshCtx.jti);
+        }
+
+        const std::string newAccess = buildJwtToken("access", refreshCtx.subject, refreshCtx.role, refreshCtx.tenantId, jwtAccessTtlSec());
+        const std::string newRefresh = buildJwtToken("refresh", refreshCtx.subject, refreshCtx.role, refreshCtx.tenantId, jwtRefreshTtlSec());
+        res.body =
+            "{"
+            "\"tokenType\":\"Bearer\","
+            "\"accessToken\":\"" + escapeJSONString(newAccess) + "\","
+            "\"refreshToken\":\"" + escapeJSONString(newRefresh) + "\","
+            "\"expiresIn\":" + std::to_string(jwtAccessTtlSec()) + ","
+            "\"role\":\"" + escapeJSONString(refreshCtx.role) + "\","
+            "\"tenantId\":\"" + escapeJSONString(refreshCtx.tenantId) + "\""
+            "}";
+        return res;
+    }
+
+    if (req.method == "POST" && routePath == "/api/auth/logout") {
+        std::string accessToken = extractApiTokenFromRequest(req);
+        if (accessToken.empty()) accessToken = extractJSONValue(req.body, "accessToken");
+        std::string refreshToken = extractJSONValue(req.body, "refreshToken");
+
+        AuthContext accessCtx;
+        if (!accessToken.empty() && tryParseAndValidateJwt(accessToken, accessCtx) && accessCtx.tokenType == "access") {
+            std::lock_guard<std::mutex> lock(g_auth_mutex);
+            g_revokedAccessTokenJti.insert(accessCtx.jti);
+        }
+
+        AuthContext refreshCtx;
+        if (!refreshToken.empty() && tryParseAndValidateJwt(refreshToken, refreshCtx) && refreshCtx.tokenType == "refresh") {
+            std::lock_guard<std::mutex> lock(g_auth_mutex);
+            g_revokedRefreshTokenJti.insert(refreshCtx.jti);
+        }
+
+        res.body = "{\"status\":\"ok\"}";
+        return res;
+    }
+
+    res.status = 404;
+    res.statusText = "Not Found";
+    res.body = "{\"error\":\"Auth endpoint not found\"}";
     return res;
 }
 
@@ -2730,6 +3171,18 @@ bool isWebSocketUpgradeRequest(const HTTPRequest& req) {
 }
 
 bool isWebSocketTokenValid(const HTTPRequest& req) {
+    if (jwtEnabled()) {
+        std::string provided = getQueryParam(req.path, "token");
+        if (provided.empty()) {
+            provided = extractBearerToken(getHeaderValue(req.headers, "Authorization"));
+        }
+        if (provided.empty()) {
+            provided = getHeaderValue(req.headers, "X-WS-Token");
+        }
+        AuthContext ctx;
+        return tryParseAndValidateJwt(provided, ctx) && ctx.tokenType == "access";
+    }
+
     static const std::string requiredToken = getEnvStringWithFallback("GIGACHAD_WS_TOKEN", "MEDIA_WS_TOKEN", "");
     if (requiredToken.empty()) {
         return true;
@@ -2776,10 +3229,14 @@ void sendHttpErrorResponse(int clientSocket, int code, const std::string& status
 }
 
 bool isPublicApiPath(const std::string& routePath) {
-    return routePath == "/api" || routePath == "/api/health";
+    return routePath == "/api" || routePath == "/api/health" ||
+           routePath == "/api/auth/login" || routePath == "/api/auth/refresh" || routePath == "/api/auth/logout";
 }
 
 bool isApiTokenProtectionEnabled() {
+    if (jwtEnabled()) {
+        return true;
+    }
     static const std::string baseToken = getEnvStringWithFallback("GIGACHAD_API_TOKEN", "MEDIA_API_TOKEN", "");
     static const std::string moderatorToken = getEnvStringWithFallback("GIGACHAD_MOD_TOKEN", "MEDIA_MOD_TOKEN", "");
     static const std::string adminToken = getEnvStringWithFallback("GIGACHAD_ADMIN_TOKEN", "MEDIA_ADMIN_TOKEN", "");
@@ -2794,12 +3251,26 @@ std::string extractApiTokenFromRequest(const HTTPRequest& req) {
     return token;
 }
 
+AuthContext extractAuthContextFromRequest(const HTTPRequest& req) {
+    AuthContext ctx;
+    const std::string token = extractApiTokenFromRequest(req);
+    if (!token.empty()) {
+        tryParseAndValidateJwt(token, ctx);
+    }
+    return ctx;
+}
+
 bool isHttpApiAuthorized(const std::string& routePath, const std::string& token) {
     if (routePath.find("/api/") != 0) {
         return true;
     }
     if (isPublicApiPath(routePath)) {
         return true;
+    }
+
+    if (jwtEnabled()) {
+        AuthContext ctx;
+        return tryParseAndValidateJwt(token, ctx) && ctx.tokenType == "access";
     }
 
     static const std::string baseToken = getEnvStringWithFallback("GIGACHAD_API_TOKEN", "MEDIA_API_TOKEN", "");
@@ -2813,6 +3284,13 @@ bool isHttpApiAuthorized(const std::string& routePath, const std::string& token)
 }
 
 std::string resolveRoleFromToken(const std::string& token) {
+    if (jwtEnabled()) {
+        AuthContext ctx;
+        if (tryParseAndValidateJwt(token, ctx) && ctx.tokenType == "access") {
+            return ctx.role;
+        }
+    }
+
     static const std::string baseToken = getEnvStringWithFallback("GIGACHAD_API_TOKEN", "MEDIA_API_TOKEN", "");
     static const std::string moderatorToken = getEnvStringWithFallback("GIGACHAD_MOD_TOKEN", "MEDIA_MOD_TOKEN", "");
     static const std::string adminToken = getEnvStringWithFallback("GIGACHAD_ADMIN_TOKEN", "MEDIA_ADMIN_TOKEN", "");
@@ -2834,6 +3312,19 @@ std::string resolveRoleFromToken(const std::string& token) {
     }
 
     return "anonymous";
+}
+
+std::string resolveTenantFromRequest(const HTTPRequest& req) {
+    if (jwtEnabled()) {
+        AuthContext ctx = extractAuthContextFromRequest(req);
+        if (ctx.valid && ctx.tokenType == "access") {
+            return normalizeTenantId(ctx.tenantId);
+        }
+    }
+
+    std::string tenant = getQueryParam(req.path, "tenantId");
+    if (tenant.empty()) tenant = getHeaderValue(req.headers, "X-Tenant-Id");
+    return normalizeTenantId(tenant);
 }
 
 int roleRank(const std::string& role) {
@@ -2903,7 +3394,26 @@ void handleWebSocketClient(int clientSocket, const HTTPRequest& req, const std::
     WebSocketClient client;
     client.socket = clientSocket;
     client.roomId = getQueryParam(req.path, "room");
-    client.userId = getQueryParam(req.path, "user");
+    if (jwtEnabled()) {
+        std::string jwtToken = getQueryParam(req.path, "token");
+        if (jwtToken.empty()) jwtToken = extractBearerToken(getHeaderValue(req.headers, "Authorization"));
+        if (jwtToken.empty()) jwtToken = getHeaderValue(req.headers, "X-WS-Token");
+        AuthContext ctx;
+        if (tryParseAndValidateJwt(jwtToken, ctx) && ctx.tokenType == "access") {
+            client.userId = ctx.subject;
+            client.tenantId = normalizeTenantId(ctx.tenantId);
+        }
+    } else {
+        client.userId = getQueryParam(req.path, "user");
+        client.tenantId = normalizeTenantId(getQueryParam(req.path, "tenant"));
+        if (client.tenantId == "default") {
+            client.tenantId = normalizeTenantId(getHeaderValue(req.headers, "X-Tenant-Id"));
+        }
+    }
+    if (client.userId.empty()) {
+        client.userId = getQueryParam(req.path, "user");
+    }
+    if (client.tenantId.empty()) client.tenantId = "default";
 
     {
         std::lock_guard<std::mutex> lock(ws_mutex);
@@ -2912,14 +3422,15 @@ void handleWebSocketClient(int clientSocket, const HTTPRequest& req, const std::
 
     broadcastEvent(
         "presence.joined",
-        "{\"user\":\"" + escapeJSONString(client.userId) + "\",\"roomId\":\"" + escapeJSONString(client.roomId) + "\"}",
-        client.roomId
+        "{\"user\":\"" + escapeJSONString(client.userId) + "\",\"roomId\":\"" + escapeJSONString(client.roomId) + "\",\"tenantId\":\"" + escapeJSONString(client.tenantId) + "\"}",
+        client.roomId,
+        client.tenantId
     );
 
     sendWebSocketFrame(
         clientSocket,
         0x1,
-        "{\"type\":\"connected\",\"roomId\":\"" + escapeJSONString(client.roomId) + "\",\"timestamp\":\"" + escapeJSONString(getCurrentTimestamp()) + "\"}"
+        "{\"type\":\"connected\",\"roomId\":\"" + escapeJSONString(client.roomId) + "\",\"tenantId\":\"" + escapeJSONString(client.tenantId) + "\",\"timestamp\":\"" + escapeJSONString(getCurrentTimestamp()) + "\"}"
     );
 
     while (true) {
@@ -2948,8 +3459,9 @@ void handleWebSocketClient(int clientSocket, const HTTPRequest& req, const std::
     removeWebSocketClient(clientSocket);
     broadcastEvent(
         "presence.left",
-        "{\"user\":\"" + escapeJSONString(client.userId) + "\",\"roomId\":\"" + escapeJSONString(client.roomId) + "\"}",
-        client.roomId
+        "{\"user\":\"" + escapeJSONString(client.userId) + "\",\"roomId\":\"" + escapeJSONString(client.roomId) + "\",\"tenantId\":\"" + escapeJSONString(client.tenantId) + "\"}",
+        client.roomId,
+        client.tenantId
     );
     closeClientSocket(clientSocket);
 }
@@ -2959,7 +3471,7 @@ HTTPResponse handleRequest(const HTTPRequest& req) {
     const std::string routePath = getPathOnly(req.path);
     res.headers["Content-Type"] = "application/json";
     res.headers["Access-Control-Allow-Origin"] = "*";
-    res.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Token, X-WS-Token";
+    res.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-API-Token, X-WS-Token, X-Tenant-Id";
     res.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";
 
     if (req.method == "OPTIONS") {
@@ -3039,13 +3551,17 @@ HTTPResponse handleRequest(const HTTPRequest& req) {
       "Header Authorization": "Bearer <token>",
       "Header X-API-Token": "<token>",
       "Env token names": "GIGACHAD_API_TOKEN or MEDIA_API_TOKEN",
+      "JWT env": "GIGACHAD_JWT_SECRET or MEDIA_JWT_SECRET",
+      "POST /api/auth/login": "Issue access+refresh JWT",
+      "POST /api/auth/refresh": "Rotate refresh and issue new tokens",
+      "POST /api/auth/logout": "Revoke provided token jti",
       "Role tokens (optional)": [
         "GIGACHAD_MOD_TOKEN / MEDIA_MOD_TOKEN",
         "GIGACHAD_ADMIN_TOKEN / MEDIA_ADMIN_TOKEN"
       ]
     },
     "Realtime": {
-      "GET /ws?room={roomId}&user={userId}&token={token}": "WebSocket event stream"
+      "GET /ws?room={roomId}&user={userId}&tenant={tenantId}&token={token}": "WebSocket event stream"
     }
   }
 })JSON";
@@ -3087,7 +3603,7 @@ HTTPResponse handleRequest(const HTTPRequest& req) {
 
     const std::string role = resolveRoleFromToken(apiToken);
     const std::string requiredRole = requiredRoleForRoute(req.method, routePath);
-    if (isApiTokenProtectionEnabled() &&
+    if ((isApiTokenProtectionEnabled() || jwtEnabled()) &&
         !isPublicApiPath(routePath) &&
         routePath.find("/api/") == 0 &&
         !isRoleAuthorized(role, requiredRole)) {
@@ -3100,6 +3616,10 @@ HTTPResponse handleRequest(const HTTPRequest& req) {
     // Route to specific handlers
     if (routePath.find("/api/chat/") == 0) {
         return handleChatAPI(req);
+    }
+
+    if (routePath.find("/api/auth/") == 0) {
+        return handleAuthAPI(req);
     }
     
     if (routePath.find("/api/voice/") == 0) {
