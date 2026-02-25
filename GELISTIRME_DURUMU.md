@@ -35,6 +35,8 @@
 - [+] Realtime Core: Multi-tenant instance Redis event bus test/otomasyon eklendi (tenant izolasyonu + tenant delivery).
 - [+] Realtime Core: Multi-tenant instance test CI pipeline'a baglandi.
 - [+] Realtime Core: JWT auth temeli kuruldu (login/refresh/logout + access/refresh token + revoke).
+- [+] Realtime Core: JWT key rotation (kid + coklu secret dogrulama) eklendi.
+- [+] Realtime Core: Refresh/access revoke kaydi SQLite'a kalici yaziliyor (restart sonrasi da gecerli).
 - [-] Realtime Core: Passkey onboarding + JWT ile birlesik auth akisi.
 
 - [-] Media Plane: 2-10 kisi icin P2P WebRTC akisi.
@@ -66,6 +68,9 @@
 - [+] JWT claim tabanli role/tenant enforcement eklendi (HTTP API + WebSocket)
 - [+] /api/auth/login, /api/auth/refresh, /api/auth/logout endpointleri eklendi
 - [+] test_auth.ps1 eklendi ve localde PASS alindi (login/refresh/logout + tenant claim enforcement)
+- [+] test_ws_jwt_tenant.ps1 eklendi ve localde PASS alindi (WS no-token block + tenant override block)
+- [+] test_auth_revocation_persistence.ps1 eklendi ve localde PASS alindi
+- [+] CI pipeline'a JWT auth + WS tenant negative test adimi eklendi
 
 
 

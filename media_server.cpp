@@ -669,10 +669,18 @@ bool initSqliteStorage() {
         "endTime TEXT,"
         "duration TEXT"
         ");";
+    const std::string createRevokedTokensSql =
+        "CREATE TABLE IF NOT EXISTS revoked_tokens ("
+        "jti TEXT PRIMARY KEY,"
+        "tokenType TEXT,"
+        "exp INTEGER,"
+        "revokedAt TEXT"
+        ");";
     bool ok = sqliteExec(db, createMessagesSql) &&
               sqliteExec(db, createCallsSql) &&
               sqliteExec(db, createStreamsSql) &&
-              sqliteExec(db, createRecordingsSql);
+              sqliteExec(db, createRecordingsSql) &&
+              sqliteExec(db, createRevokedTokensSql);
     if (ok) {
         sqliteExec(db, "ALTER TABLE messages ADD COLUMN tenantId TEXT DEFAULT 'default';");
     }
@@ -1426,6 +1434,79 @@ void loadRecordingsFromDisk() {
     }
 }
 
+bool persistRevokedTokenJtiToSqlite(const std::string& tokenType, const std::string& jti, int exp) {
+    if (jti.empty()) return false;
+    if (!g_sqliteReady && !initSqliteStorage()) return false;
+
+    std::lock_guard<std::mutex> lock(sqlite_mutex);
+    sqlite3* db = nullptr;
+    if (p_sqlite3_open(kSqliteDbFile.c_str(), &db) != SQLITE_OK || db == nullptr) {
+        if (db) p_sqlite3_close(db);
+        return false;
+    }
+
+    const char* sql = "INSERT OR REPLACE INTO revoked_tokens(jti, tokenType, exp, revokedAt) VALUES(?, ?, ?, ?);";
+    sqlite3_stmt* stmt = nullptr;
+    if (p_sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK || stmt == nullptr) {
+        p_sqlite3_close(db);
+        return false;
+    }
+
+    auto transient = reinterpret_cast<void(*)(void*)>(-1);
+    bool ok = p_sqlite3_bind_text(stmt, 1, jti.c_str(), -1, transient) == SQLITE_OK &&
+              p_sqlite3_bind_text(stmt, 2, tokenType.c_str(), -1, transient) == SQLITE_OK &&
+              p_sqlite3_bind_text(stmt, 3, std::to_string(exp).c_str(), -1, transient) == SQLITE_OK &&
+              p_sqlite3_bind_text(stmt, 4, getCurrentTimestamp().c_str(), -1, transient) == SQLITE_OK;
+    if (ok) {
+        ok = p_sqlite3_step(stmt) == SQLITE_DONE;
+    }
+    p_sqlite3_finalize(stmt);
+    p_sqlite3_close(db);
+    return ok;
+}
+
+void loadRevokedTokenJtiFromSqlite() {
+    if (!g_sqliteReady && !initSqliteStorage()) return;
+
+    std::lock_guard<std::mutex> lock(sqlite_mutex);
+    sqlite3* db = nullptr;
+    if (p_sqlite3_open(kSqliteDbFile.c_str(), &db) != SQLITE_OK || db == nullptr) {
+        if (db) p_sqlite3_close(db);
+        return;
+    }
+
+    const int now = static_cast<int>(std::time(nullptr));
+    sqliteExec(db, "DELETE FROM revoked_tokens WHERE exp IS NOT NULL AND exp > 0 AND exp < " + std::to_string(now) + ";");
+
+    const char* sql = "SELECT jti, tokenType FROM revoked_tokens;";
+    sqlite3_stmt* stmt = nullptr;
+    if (p_sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK || stmt == nullptr) {
+        p_sqlite3_close(db);
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> authLock(g_auth_mutex);
+        g_revokedAccessTokenJti.clear();
+        g_revokedRefreshTokenJti.clear();
+        while (true) {
+            int rc = p_sqlite3_step(stmt);
+            if (rc == SQLITE_DONE) break;
+            if (rc != SQLITE_ROW) break;
+            const unsigned char* c0 = p_sqlite3_column_text(stmt, 0);
+            const unsigned char* c1 = p_sqlite3_column_text(stmt, 1);
+            std::string jti = c0 ? reinterpret_cast<const char*>(c0) : "";
+            std::string type = c1 ? reinterpret_cast<const char*>(c1) : "";
+            if (jti.empty()) continue;
+            if (type == "refresh") g_revokedRefreshTokenJti.insert(jti);
+            else g_revokedAccessTokenJti.insert(jti);
+        }
+    }
+
+    p_sqlite3_finalize(stmt);
+    p_sqlite3_close(db);
+}
+
 void loadPersistedData() {
     ensureDataDirectory();
     if (!storageModeIsJsonlOnly()) {
@@ -1435,6 +1516,7 @@ void loadPersistedData() {
     loadCallsFromDisk();
     loadStreamsFromDisk();
     loadRecordingsFromDisk();
+    loadRevokedTokenJtiFromSqlite();
 }
 
 int getEnvInt(const char* name, int defaultValue) {
@@ -1486,6 +1568,7 @@ std::string extractBearerToken(const std::string& authHeader) {
 
 std::string base64Encode(const uint8_t* data, size_t len);
 std::string escapeJSONString(const std::string& s);
+int nowEpochSec();
 
 struct AuthContext {
     bool valid = false;
@@ -1497,6 +1580,11 @@ struct AuthContext {
     int exp = 0;
 };
 
+struct JwtSigningKey {
+    std::string kid;
+    std::string secret;
+};
+
 std::string trimWhitespace(const std::string& input) {
     std::string out = input;
     auto isWs = [](unsigned char c) { return std::isspace(c) != 0; };
@@ -1506,13 +1594,92 @@ std::string trimWhitespace(const std::string& input) {
 }
 
 bool jwtEnabled() {
-    static const std::string secret = trimWhitespace(getEnvStringWithFallback("GIGACHAD_JWT_SECRET", "MEDIA_JWT_SECRET", ""));
-    return !secret.empty();
+    auto keys = []() {
+        std::vector<JwtSigningKey> out;
+        std::string rawList = trimWhitespace(getEnvStringWithFallback("GIGACHAD_JWT_KEYS", "MEDIA_JWT_KEYS", ""));
+        if (!rawList.empty()) {
+            for (char& c : rawList) {
+                if (c == ';') c = ',';
+            }
+            std::stringstream ss(rawList);
+            std::string item;
+            while (std::getline(ss, item, ',')) {
+                item = trimWhitespace(item);
+                if (item.empty()) continue;
+                size_t pos = item.find(':');
+                JwtSigningKey k;
+                if (pos == std::string::npos) {
+                    k.kid = "";
+                    k.secret = trimWhitespace(item);
+                } else {
+                    k.kid = trimWhitespace(item.substr(0, pos));
+                    k.secret = trimWhitespace(item.substr(pos + 1));
+                }
+                if (!k.secret.empty()) out.push_back(k);
+            }
+        }
+        if (out.empty()) {
+            std::string fallbackSecret = trimWhitespace(getEnvStringWithFallback("GIGACHAD_JWT_SECRET", "MEDIA_JWT_SECRET", ""));
+            if (!fallbackSecret.empty()) {
+                out.push_back(JwtSigningKey{"default", fallbackSecret});
+            }
+        }
+        return out;
+    }();
+    return !keys.empty();
 }
 
-std::string jwtSecret() {
-    static const std::string secret = trimWhitespace(getEnvStringWithFallback("GIGACHAD_JWT_SECRET", "MEDIA_JWT_SECRET", ""));
-    return secret;
+const std::vector<JwtSigningKey>& jwtSigningKeys() {
+    static const std::vector<JwtSigningKey> keys = []() {
+        std::vector<JwtSigningKey> out;
+        std::string rawList = trimWhitespace(getEnvStringWithFallback("GIGACHAD_JWT_KEYS", "MEDIA_JWT_KEYS", ""));
+        if (!rawList.empty()) {
+            for (char& c : rawList) {
+                if (c == ';') c = ',';
+            }
+            std::stringstream ss(rawList);
+            std::string item;
+            while (std::getline(ss, item, ',')) {
+                item = trimWhitespace(item);
+                if (item.empty()) continue;
+                size_t pos = item.find(':');
+                JwtSigningKey k;
+                if (pos == std::string::npos) {
+                    k.kid = "";
+                    k.secret = trimWhitespace(item);
+                } else {
+                    k.kid = trimWhitespace(item.substr(0, pos));
+                    k.secret = trimWhitespace(item.substr(pos + 1));
+                }
+                if (!k.secret.empty()) out.push_back(k);
+            }
+        }
+        if (out.empty()) {
+            std::string fallbackSecret = trimWhitespace(getEnvStringWithFallback("GIGACHAD_JWT_SECRET", "MEDIA_JWT_SECRET", ""));
+            if (!fallbackSecret.empty()) {
+                out.push_back(JwtSigningKey{"default", fallbackSecret});
+            }
+        }
+        return out;
+    }();
+    return keys;
+}
+
+std::string jwtActiveKid() {
+    static const std::string activeKid = trimWhitespace(getEnvStringWithFallback("GIGACHAD_JWT_ACTIVE_KID", "MEDIA_JWT_ACTIVE_KID", ""));
+    return activeKid;
+}
+
+JwtSigningKey jwtActiveSigningKey() {
+    const auto& keys = jwtSigningKeys();
+    if (keys.empty()) return JwtSigningKey{};
+    const std::string active = jwtActiveKid();
+    if (!active.empty()) {
+        for (const auto& k : keys) {
+            if (k.kid == active) return k;
+        }
+    }
+    return keys.front();
 }
 
 int jwtAccessTtlSec() {
@@ -1673,10 +1840,18 @@ int nowEpochSec() {
 }
 
 std::string buildJwtToken(const std::string& tokenType, const std::string& subject, const std::string& role, const std::string& tenantId, int ttlSec) {
+    const JwtSigningKey key = jwtActiveSigningKey();
+    if (key.secret.empty()) {
+        return "";
+    }
     const int now = nowEpochSec();
     const int exp = now + ttlSec;
     const std::string jti = generateId(tokenType + "_");
-    const std::string headerJson = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+    std::string headerJson = "{\"alg\":\"HS256\",\"typ\":\"JWT\"";
+    if (!key.kid.empty()) {
+        headerJson += ",\"kid\":\"" + escapeJSONString(key.kid) + "\"";
+    }
+    headerJson += "}";
     const std::string payloadJson =
         "{\"sub\":\"" + escapeJSONString(subject) +
         "\",\"role\":\"" + escapeJSONString(role) +
@@ -1689,7 +1864,7 @@ std::string buildJwtToken(const std::string& tokenType, const std::string& subje
     const std::string headerB64 = base64UrlEncode(reinterpret_cast<const uint8_t*>(headerJson.data()), headerJson.size());
     const std::string payloadB64 = base64UrlEncode(reinterpret_cast<const uint8_t*>(payloadJson.data()), payloadJson.size());
     const std::string signingInput = headerB64 + "." + payloadB64;
-    const auto sig = hmacSha256(jwtSecret(), signingInput);
+    const auto sig = hmacSha256(key.secret, signingInput);
     const std::string sigB64 = base64UrlEncode(sig.data(), sig.size());
     return signingInput + "." + sigB64;
 }
@@ -1701,9 +1876,25 @@ bool tryParseAndValidateJwt(const std::string& token, AuthContext& outCtx) {
     if (parts.size() != 3) return false;
 
     const std::string signingInput = parts[0] + "." + parts[1];
-    const auto expectedSig = hmacSha256(jwtSecret(), signingInput);
-    const std::string expectedSigB64 = base64UrlEncode(expectedSig.data(), expectedSig.size());
-    if (expectedSigB64 != parts[2]) return false;
+
+    const std::string headerJson = base64UrlDecodeToString(parts[0]);
+    if (headerJson.empty()) return false;
+    const std::string tokenKid = extractJSONValue(headerJson, "kid");
+
+    bool signatureOk = false;
+    const auto& keys = jwtSigningKeys();
+    for (const auto& key : keys) {
+        if (!tokenKid.empty() && key.kid != tokenKid) {
+            continue;
+        }
+        const auto expectedSig = hmacSha256(key.secret, signingInput);
+        const std::string expectedSigB64 = base64UrlEncode(expectedSig.data(), expectedSig.size());
+        if (expectedSigB64 == parts[2]) {
+            signatureOk = true;
+            break;
+        }
+    }
+    if (!signatureOk) return false;
 
     const std::string payloadJson = base64UrlDecodeToString(parts[1]);
     if (payloadJson.empty()) return false;
@@ -2613,6 +2804,7 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
             std::lock_guard<std::mutex> lock(g_auth_mutex);
             g_revokedRefreshTokenJti.insert(refreshCtx.jti);
         }
+        persistRevokedTokenJtiToSqlite("refresh", refreshCtx.jti, refreshCtx.exp);
 
         const std::string newAccess = buildJwtToken("access", refreshCtx.subject, refreshCtx.role, refreshCtx.tenantId, jwtAccessTtlSec());
         const std::string newRefresh = buildJwtToken("refresh", refreshCtx.subject, refreshCtx.role, refreshCtx.tenantId, jwtRefreshTtlSec());
@@ -2635,14 +2827,20 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
 
         AuthContext accessCtx;
         if (!accessToken.empty() && tryParseAndValidateJwt(accessToken, accessCtx) && accessCtx.tokenType == "access") {
-            std::lock_guard<std::mutex> lock(g_auth_mutex);
-            g_revokedAccessTokenJti.insert(accessCtx.jti);
+            {
+                std::lock_guard<std::mutex> lock(g_auth_mutex);
+                g_revokedAccessTokenJti.insert(accessCtx.jti);
+            }
+            persistRevokedTokenJtiToSqlite("access", accessCtx.jti, accessCtx.exp);
         }
 
         AuthContext refreshCtx;
         if (!refreshToken.empty() && tryParseAndValidateJwt(refreshToken, refreshCtx) && refreshCtx.tokenType == "refresh") {
-            std::lock_guard<std::mutex> lock(g_auth_mutex);
-            g_revokedRefreshTokenJti.insert(refreshCtx.jti);
+            {
+                std::lock_guard<std::mutex> lock(g_auth_mutex);
+                g_revokedRefreshTokenJti.insert(refreshCtx.jti);
+            }
+            persistRevokedTokenJtiToSqlite("refresh", refreshCtx.jti, refreshCtx.exp);
         }
 
         res.body = "{\"status\":\"ok\"}";
