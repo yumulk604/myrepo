@@ -45,6 +45,7 @@
 - [+] Realtime Core: Passkey endpoint rate-limit eklendi (IP+username, 429, env ile ayarlanabilir).
 - [+] Realtime Core: Passkey lockout/backoff eklendi (tekrarli login hatalarinda gecici kilit + Retry-After).
 - [+] Realtime Core: Auth audit log eklendi (data/auth_audit.jsonl).
+- [+] Realtime Core: Passkey tenant-aware credential izolasyonu sikilastirildi (tenant+credentialId lookup).
 - [+] Realtime Core: Passkey credential persistence eklendi (SQLite + disk fallback, restart sonrasi login devam).
 - [-] Realtime Core: Passkey tam WebAuthn COSE public-key (ECDSA/EdDSA) signature verification (production hardening).
 
@@ -91,6 +92,7 @@
 - [+] CI pipeline'a passkey rate-limit test adimi eklendi.
 - [+] test_auth_passkey_lockout.ps1 eklendi ve PASS alindi (tekrarli bad-signature denemelerinde lockout 429).
 - [+] CI pipeline'a passkey lockout test adimi eklendi.
+- [+] test_auth_passkey.ps1 tenant-cross login negatif senaryosu ile genisletildi.
 
 
 

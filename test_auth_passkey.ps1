@@ -183,6 +183,36 @@ try {
         throw "JWT tenant enforcement calismadi."
     }
 
+    $otherTenant = "tenant-other"
+    $crossChallengeBody = @{ username = $username; flow = "login"; tenantId = $otherTenant; rpId = $rpId; origin = $origin } | ConvertTo-Json -Compress
+    $crossChallenge = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $Port + "/api/auth/passkey/challenge") -Method Post -ContentType "application/json" -Body $crossChallengeBody
+    $crossClientDataJson = (@{ type = "webauthn.get"; challenge = $crossChallenge.challenge; origin = $origin } | ConvertTo-Json -Compress)
+    $crossClientDataB64 = Convert-ToBase64Url -Bytes ([System.Text.Encoding]::UTF8.GetBytes($crossClientDataJson))
+    $crossAuthData = Get-AuthenticatorDataB64 -RpId $rpId -SignCount 3
+    $crossSig = Get-SignatureB64 -CredentialKey $publicKey -AuthenticatorDataB64 $crossAuthData -ClientDataJson $crossClientDataJson
+    $crossBody = @{
+        username = $username
+        challengeId = $crossChallenge.challengeId
+        challenge = $crossChallenge.challenge
+        credentialId = $credentialId
+        signCount = 3
+        rpId = $rpId
+        origin = $origin
+        clientDataType = "webauthn.get"
+        clientDataJSON = $crossClientDataB64
+        authenticatorData = $crossAuthData
+        signature = $crossSig
+    } | ConvertTo-Json -Compress
+    $crossBlocked = $false
+    try {
+        Invoke-RestMethod -Uri ("http://127.0.0.1:" + $Port + "/api/auth/passkey/login") -Method Post -ContentType "application/json" -Body $crossBody | Out-Null
+    } catch {
+        $crossBlocked = $true
+    }
+    if (-not $crossBlocked) {
+        throw "Tenant izolasyonu bozuk: baska tenantta ayni credential ile login basarili oldu."
+    }
+
     $badSigChallenge = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $Port + "/api/auth/passkey/challenge") -Method Post -ContentType "application/json" -Body $loginChallengeBody
     $badSigClientDataJson = (@{ type = "webauthn.get"; challenge = $badSigChallenge.challenge; origin = $origin } | ConvertTo-Json -Compress)
     $badSigClientDataB64 = Convert-ToBase64Url -Bytes ([System.Text.Encoding]::UTF8.GetBytes($badSigClientDataJson))

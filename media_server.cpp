@@ -515,6 +515,10 @@ std::string normalizeTenantId(const std::string& rawTenant) {
     return tenant;
 }
 
+std::string normalizeUsername(const std::string& rawUser) {
+    return toLower(trimWhitespace(rawUser));
+}
+
 bool hasJSONKey(const std::string& json, const std::string& key) {
     return json.find("\"" + key + "\":") != std::string::npos;
 }
@@ -1620,7 +1624,7 @@ void loadPasskeyCredentialsFromSqlite() {
         const unsigned char* c5 = p_sqlite3_column_text(stmt, 5);
         const unsigned char* c6 = p_sqlite3_column_text(stmt, 6);
 
-        std::string username = c0 ? reinterpret_cast<const char*>(c0) : "";
+        std::string username = normalizeUsername(c0 ? reinterpret_cast<const char*>(c0) : "");
         std::string credentialId = c1 ? reinterpret_cast<const char*>(c1) : "";
         if (username.empty() || credentialId.empty()) {
             continue;
@@ -1633,7 +1637,7 @@ void loadPasskeyCredentialsFromSqlite() {
         cred.role = c4 ? reinterpret_cast<const char*>(c4) : "user";
         cred.tenantId = normalizeTenantId(c5 ? reinterpret_cast<const char*>(c5) : "default");
         cred.createdAt = c6 ? reinterpret_cast<const char*>(c6) : "";
-        loaded[username].push_back(cred);
+        loaded[normalizeUsername(username)].push_back(cred);
     }
 
     p_sqlite3_finalize(stmt);
@@ -1649,7 +1653,7 @@ void loadPasskeyCredentialsFromDisk() {
     std::map<std::string, std::vector<PasskeyCredential>> loaded;
     auto lines = readLinesFromFile(kPasskeysFile);
     for (const auto& line : lines) {
-        const std::string username = trimWhitespace(extractJSONValue(line, "username"));
+        const std::string username = normalizeUsername(extractJSONValue(line, "username"));
         const std::string credentialId = trimWhitespace(extractJSONValue(line, "credentialId"));
         if (username.empty() || credentialId.empty()) {
             continue;
@@ -1665,7 +1669,7 @@ void loadPasskeyCredentialsFromDisk() {
         }
         cred.tenantId = normalizeTenantId(extractJSONValue(line, "tenantId"));
         cred.createdAt = extractJSONValue(line, "createdAt");
-        loaded[username].push_back(cred);
+        loaded[normalizeUsername(username)].push_back(cred);
     }
     {
         std::lock_guard<std::mutex> authLock(g_auth_mutex);
@@ -3322,8 +3326,8 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
     }
 
     const bool isPasskeyRoute = routePath.find("/api/auth/passkey/") == 0;
-    std::string passkeyUsername = trimWhitespace(extractJSONValue(req.body, "username"));
-    if (passkeyUsername.empty()) passkeyUsername = trimWhitespace(extractJSONValue(req.body, "user"));
+    std::string passkeyUsername = normalizeUsername(extractJSONValue(req.body, "username"));
+    if (passkeyUsername.empty()) passkeyUsername = normalizeUsername(extractJSONValue(req.body, "user"));
     std::string passkeyTenant = normalizeTenantId(extractJSONValue(req.body, "tenantId"));
     const std::string passkeyClientIp = resolveClientIpFromHeaders(req.headers);
     const std::string passkeyFailKey = passkeyFailureKey(passkeyClientIp, passkeyUsername);
@@ -3353,9 +3357,9 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
     }
 
     if (req.method == "POST" && routePath == "/api/auth/passkey/challenge") {
-        std::string username = trimWhitespace(extractJSONValue(req.body, "username"));
+        std::string username = normalizeUsername(extractJSONValue(req.body, "username"));
         if (username.empty()) {
-            username = trimWhitespace(extractJSONValue(req.body, "user"));
+            username = normalizeUsername(extractJSONValue(req.body, "user"));
         }
         if (username.empty()) {
             res.status = 400;
@@ -3423,8 +3427,8 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
     if (req.method == "POST" && routePath == "/api/auth/passkey/register") {
         const std::string challengeId = trimWhitespace(extractJSONValue(req.body, "challengeId"));
         const std::string challenge = trimWhitespace(extractJSONValue(req.body, "challenge"));
-        std::string username = trimWhitespace(extractJSONValue(req.body, "username"));
-        if (username.empty()) username = trimWhitespace(extractJSONValue(req.body, "user"));
+        std::string username = normalizeUsername(extractJSONValue(req.body, "username"));
+        if (username.empty()) username = normalizeUsername(extractJSONValue(req.body, "user"));
         const std::string credentialId = trimWhitespace(extractJSONValue(req.body, "credentialId"));
         const std::string publicKey = trimWhitespace(extractJSONValue(req.body, "publicKey"));
         int signCount = extractJSONIntValue(req.body, "signCount", 0);
@@ -3501,7 +3505,7 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
             const PasskeyChallengeState challengeState = it->second;
             if (challengeState.flow != "register" ||
                 challengeState.challenge != challenge ||
-                challengeState.username != username ||
+                normalizeUsername(challengeState.username) != username ||
                 challengeState.expiresAt <= now) {
                 g_passkeyChallenges.erase(it);
                 res.status = 401;
@@ -3529,9 +3533,10 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
                 role = "moderator";
             }
 
-            auto& creds = g_passkeyCredentialsByUser[username];
+            auto& creds = g_passkeyCredentialsByUser[normalizeUsername(username)];
             auto credIt = std::find_if(creds.begin(), creds.end(), [&](const PasskeyCredential& c) {
-                return c.credentialId == credentialId;
+                return c.credentialId == credentialId &&
+                       normalizeTenantId(c.tenantId) == normalizeTenantId(tenantId);
             });
             if (credIt == creds.end()) {
                 PasskeyCredential cred;
@@ -3574,8 +3579,8 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
     if (req.method == "POST" && routePath == "/api/auth/passkey/login") {
         const std::string challengeId = trimWhitespace(extractJSONValue(req.body, "challengeId"));
         const std::string challenge = trimWhitespace(extractJSONValue(req.body, "challenge"));
-        std::string username = trimWhitespace(extractJSONValue(req.body, "username"));
-        if (username.empty()) username = trimWhitespace(extractJSONValue(req.body, "user"));
+        std::string username = normalizeUsername(extractJSONValue(req.body, "username"));
+        if (username.empty()) username = normalizeUsername(extractJSONValue(req.body, "user"));
         const std::string credentialId = trimWhitespace(extractJSONValue(req.body, "credentialId"));
         int signCount = extractJSONIntValue(req.body, "signCount", -1);
         const std::string reqRpId = trimWhitespace(extractJSONValue(req.body, "rpId"));
@@ -3618,6 +3623,7 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
         PasskeyCredential selected;
         bool found = false;
         bool signCountChanged = false;
+        std::string expectedTenantForLogin = "default";
         const int now = nowEpochSec();
         {
             std::lock_guard<std::mutex> lock(g_auth_mutex);
@@ -3629,7 +3635,7 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
             const PasskeyChallengeState challengeState = challengeIt->second;
             if (challengeState.flow != "login" ||
                 challengeState.challenge != challenge ||
-                challengeState.username != username ||
+                normalizeUsername(challengeState.username) != username ||
                 challengeState.expiresAt <= now) {
                 g_passkeyChallenges.erase(challengeIt);
                 return passkeyFail(401, "Unauthorized", "Challenge verification failed", "challenge_verify_failed");
@@ -3642,11 +3648,14 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
             }
             g_passkeyChallenges.erase(challengeIt);
 
-            auto userCredsIt = g_passkeyCredentialsByUser.find(username);
+            const std::string lookupTenant = normalizeTenantId(challengeState.tenantId);
+            expectedTenantForLogin = lookupTenant;
+            auto userCredsIt = g_passkeyCredentialsByUser.find(normalizeUsername(username));
             if (userCredsIt != g_passkeyCredentialsByUser.end()) {
                 auto& creds = userCredsIt->second;
                 auto credIt = std::find_if(creds.begin(), creds.end(), [&](const PasskeyCredential& c) {
-                    return c.credentialId == credentialId;
+                    return c.credentialId == credentialId &&
+                           normalizeTenantId(c.tenantId) == lookupTenant;
                 });
                 if (credIt != creds.end()) {
                     if (passkeyStrictMetadataEnabled()) {
@@ -3686,6 +3695,9 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
 
         if (!found) {
             return passkeyFail(401, "Unauthorized", "Passkey credential not found", "credential_not_found");
+        }
+        if (normalizeTenantId(selected.tenantId) != normalizeTenantId(expectedTenantForLogin)) {
+            return passkeyFail(401, "Unauthorized", "Passkey tenant isolation check failed", "tenant_mismatch");
         }
 
         const std::string accessToken = buildJwtToken("access", username, selected.role, selected.tenantId, jwtAccessTtlSec());
