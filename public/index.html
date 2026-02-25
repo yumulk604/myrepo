@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Media Server Dashboard</title>
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <!-- Header -->
+    <header class="header">
+        <div class="container">
+            <div class="logo">
+                <i class="fas fa-broadcast-tower"></i>
+                <h1>Media Server</h1>
+                <span class="version">v2.0</span>
+            </div>
+            <div class="header-right">
+                <div class="server-status" id="serverStatus">
+                    <span class="status-dot"></span>
+                    <span class="status-text">Checking...</span>
+                </div>
+                <div class="user-info">
+                    <input type="text" id="username" placeholder="Kullanıcı adınız" value="Misafir">
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Hero / Status Overview -->
+    <section class="hero-panel container">
+        <div class="hero-text">
+            <p class="eyebrow">Gerçek zamanlı medya kontrolü</p>
+            <h2>Akışları, aramaları ve kayıtları tek panelden yönetin.</h2>
+            <p class="subtext">Modern görünüm, hızlı geri bildirim ve gelişmiş durum kartları ile medya sunucunuzun nabzını tutun.</p>
+            <div class="hero-meta">
+                <span class="chip" id="healthChip">
+                    <i class="fas fa-circle-notch"></i>
+                    <span id="healthText">Durum kontrol ediliyor...</span>
+                </span>
+                <span class="chip subtle">
+                    <i class="fas fa-clock"></i>
+                    <span id="heroTimestamp">-</span>
+                </span>
+                <span class="chip outline">
+                    <i class="fas fa-globe"></i>
+                    <span id="heroAddress">http://localhost:8080</span>
+                </span>
+            </div>
+        </div>
+        <div class="hero-stats">
+            <div class="mini-stat">
+                <p>Mesajlar</p>
+                <h3 id="miniStatMessages">0</h3>
+                <span class="mini-label">Sohbet trafiği</span>
+            </div>
+            <div class="mini-stat">
+                <p>Aramalar</p>
+                <h3 id="miniStatCalls">0</h3>
+                <span class="mini-label">Ses &amp; video</span>
+            </div>
+            <div class="mini-stat">
+                <p>Canlı Yayın</p>
+                <h3 id="miniStatStreams">0</h3>
+                <span class="mini-label">Aktif yayınlar</span>
+            </div>
+        </div>
+    </section>
+
+    <!-- Main Container -->
+    <div class="container main-container">
+            <!-- Sidebar -->
+        <aside class="sidebar">
+            <nav class="nav-menu">
+                <a href="#" class="nav-item active" data-tab="notepad">
+                    <i class="fas fa-sticky-note"></i>
+                    <span>Not Defteri</span>
+                </a>
+                <a href="#" class="nav-item" data-tab="voice">
+                    <i class="fas fa-phone"></i>
+                    <span>Sesli Arama</span>
+                    <span class="badge" id="voiceBadge">0</span>
+                </a>
+                <a href="#" class="nav-item" data-tab="video">
+                    <i class="fas fa-video"></i>
+                    <span>Görüntülü Arama</span>
+                    <span class="badge" id="videoBadge">0</span>
+                </a>
+                <a href="#" class="nav-item" data-tab="recording">
+                    <i class="fas fa-record-vinyl"></i>
+                    <span>Ekran Kaydı</span>
+                    <span class="badge" id="recordingBadge">0</span>
+                </a>
+                <a href="#" class="nav-item" data-tab="stream">
+                    <i class="fas fa-broadcast-tower"></i>
+                    <span>Canlı Yayın</span>
+                    <span class="badge" id="streamBadge">0</span>
+                </a>
+                <a href="#" class="nav-item" data-tab="stats">
+                    <i class="fas fa-chart-bar"></i>
+                    <span>İstatistikler</span>
+                </a>
+            </nav>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Notepad + Chat Tab -->
+            <div class="tab-content active" id="notepad-tab">
+                <div class="content-header">
+                    <h2><i class="fas fa-comments"></i> Sohbet + Not Defteri</h2>
+                    <span id="saveStatus" style="color: #4ade80; font-size: 0.9em; display: none;">
+                        <i class="fas fa-check"></i> Kaydedildi
+                    </span>
+                </div>
+
+                <div class="chat-card" style="margin-bottom: 16px; padding: 14px; border: 1px solid #334155; border-radius: 10px; background: #0f172a;">
+                    <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap;">
+                        <label for="chatRoomId" style="min-width: 60px;">Oda:</label>
+                        <input type="text" id="chatRoomId" class="form-control" value="global" style="max-width: 220px;">
+                        <span style="color: #94a3b8; font-size: 0.9em;">Canli mesaj: <strong id="chatRoomLabel">global</strong></span>
+                    </div>
+
+                    <div id="chatMessages" style="height: 220px; overflow-y: auto; border: 1px solid #334155; border-radius: 8px; padding: 10px; margin-bottom: 10px; background: #111827;">
+                        <div class="empty-state">
+                            <i class="fas fa-comment-slash"></i>
+                            <p>Bu odada henuz mesaj yok</p>
+                        </div>
+                    </div>
+
+                    <div style="display: flex; gap: 10px; align-items: center;">
+                        <input type="text" id="chatMessageInput" class="form-control" placeholder="Mesaj yaz...">
+                        <button onclick="sendChatMessage()" class="btn btn-primary">
+                            <i class="fas fa-paper-plane"></i> Gonder
+                        </button>
+                    </div>
+                </div>
+                
+                <div class="notepad-container" style="height: calc(100vh - 140px); display: flex; flex-direction: column;">
+                    <textarea id="notepadArea" placeholder="Notlarınızı buraya yazın... (Otomatik kaydedilir)" 
+                        style="flex: 1; width: 100%; padding: 20px; border-radius: 8px; border: 1px solid #334155; background: #1e293b; color: #fff; font-size: 16px; resize: none; font-family: inherit; line-height: 1.6;"></textarea>
+                </div>
+            </div>
+
+            <!-- Voice Call Tab -->
+            <div class="tab-content" id="voice-tab">
+                <div class="content-header">
+                    <h2><i class="fas fa-phone"></i> Sesli Arama</h2>
+                </div>
+                
+                <div class="call-interface">
+                    <div class="call-card">
+                        <h3>Yeni Sesli Arama Başlat</h3>
+                        <div class="form-group">
+                            <label>Aranacak Kişi:</label>
+                            <input type="text" id="voiceReceiverId" placeholder="Kullanıcı ID" class="form-control">
+                        </div>
+                        <div class="form-group">
+                            <label>İsim:</label>
+                            <input type="text" id="voiceReceiverName" placeholder="Kişi adı" class="form-control">
+                        </div>
+                        <button onclick="startVoiceCall()" class="btn btn-success btn-lg">
+                            <i class="fas fa-phone"></i> Aramayı Başlat
+                        </button>
+                    </div>
+
+                    <div class="active-calls">
+                        <h3>Aktif Aramalar</h3>
+                        <div id="activeVoiceCalls" class="calls-list">
+                            <div class="empty-state">
+                                <i class="fas fa-phone-slash"></i>
+                                <p>Aktif arama yok</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Video Call Tab -->
+            <div class="tab-content" id="video-tab">
+                <div class="content-header">
+                    <h2><i class="fas fa-video"></i> Görüntülü Arama</h2>
+                </div>
+                
+                <div class="call-interface">
+                    <div class="call-card">
+                        <h3>Yeni Video Arama Başlat</h3>
+                        <div class="form-group">
+                            <label>Aranacak Kişi:</label>
+                            <input type="text" id="videoReceiverId" placeholder="Kullanıcı ID" class="form-control">
+                        </div>
+                        <div class="form-group">
+                            <label>İsim:</label>
+                            <input type="text" id="videoReceiverName" placeholder="Kişi adı" class="form-control">
+                        </div>
+                        <button onclick="startVideoCall()" class="btn btn-primary btn-lg">
+                            <i class="fas fa-video"></i> Video Aramayı Başlat
+                        </button>
+                    </div>
+
+                    <div class="active-calls">
+                        <h3>Aktif Video Aramaları</h3>
+                        <div id="activeVideoCalls" class="calls-list">
+                            <div class="empty-state">
+                                <i class="fas fa-video-slash"></i>
+                                <p>Aktif video araması yok</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Screen Recording Tab -->
+            <div class="tab-content" id="recording-tab">
+                <div class="content-header">
+                    <h2><i class="fas fa-record-vinyl"></i> Ekran Kaydı</h2>
+                    <div id="recordingControls" style="display: flex; gap: 10px;">
+                        <span id="recordingTimer" style="display: none; font-size: 18px; font-weight: bold; color: #ef4444;">
+                            <i class="fas fa-circle" style="color: #ef4444; animation: pulse 1s infinite;"></i>
+                            <span id="timerDisplay">00:00</span>
+                        </span>
+                    </div>
+                </div>
+                
+                <div class="recording-interface">
+                    <div class="recording-settings">
+                        <h3>Kayıt Ayarları</h3>
+                        
+                        <div class="form-group">
+                            <label>Video Kalitesi:</label>
+                            <select id="recordingQuality" class="form-control">
+                                <option value="1080p" selected>1080p (Full HD)</option>
+                                <option value="720p">720p (HD)</option>
+                                <option value="480p">480p (SD)</option>
+                            </select>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label>Kayıt Kaynağı:</label>
+                            <select id="captureType" class="form-control">
+                                <option value="screen" selected>Tam Ekran</option>
+                                <option value="window">Pencere</option>
+                                <option value="tab">Tarayıcı Sekmesi</option>
+                            </select>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label>Dosya Adı:</label>
+                            <input type="text" id="recordingFilename" placeholder="ekran-kaydi" class="form-control">
+                            <small style="color: #64748b;">Otomatik tarih/saat eklenecek</small>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label>
+                                <input type="checkbox" id="includeAudio" checked>
+                                Ses Kaydı Ekle (Sistem Sesi + Mikrofon)
+                            </label>
+                        </div>
+                        
+                        <div class="recording-preview" id="recordingPreview" style="display: none;">
+                            <video id="previewVideo" autoplay muted style="width: 100%; border-radius: 8px; background: #000;"></video>
+                        </div>
+                        
+                        <div class="recording-actions">
+                            <button id="startRecordingBtn" onclick="startScreenRecording()" class="btn btn-danger btn-lg">
+                                <i class="fas fa-circle"></i> Kaydı Başlat
+                            </button>
+                            <button id="stopRecordingBtn" onclick="stopScreenRecording()" class="btn btn-secondary btn-lg" style="display: none;">
+                                <i class="fas fa-stop"></i> Kaydı Durdur
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="recordings-list-container">
+                        <h3>Kayıt Geçmişi</h3>
+                        <div id="recordingsList" class="recordings-list">
+                            <div class="empty-state">
+                                <i class="fas fa-file-video"></i>
+                                <p>Henüz kayıt yok</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Live Stream Tab -->
+            <div class="tab-content" id="stream-tab">
+                <div class="content-header">
+                    <h2><i class="fas fa-broadcast-tower"></i> Canlı Yayın</h2>
+                </div>
+                
+                <div class="stream-interface">
+                    <div class="stream-card">
+                        <h3>Yeni Canlı Yayın Başlat</h3>
+                        <div class="form-group">
+                            <label>Yayın Başlığı:</label>
+                            <input type="text" id="streamTitle" placeholder="Yayın başlığı" class="form-control">
+                        </div>
+                        <div class="form-group">
+                            <label>Açıklama:</label>
+                            <textarea id="streamDescription" placeholder="Yayın açıklaması" class="form-control" rows="3"></textarea>
+                        </div>
+                        
+                        <!-- Stream Camera Preview -->
+                        <div id="streamPreviewContainer" style="display: none; margin: 15px 0;">
+                            <p style="margin-bottom: 5px; color: #94a3b8; font-size: 0.9em;">
+                                <i class="fas fa-camera"></i> Kamera Önizleme
+                                <span id="streamRecordingIndicator" style="color: #ef4444; margin-left: 10px; font-weight: bold; animation: pulse 1s infinite;">
+                                    <i class="fas fa-circle"></i> KAYDEDİLİYOR
+                                </span>
+                            </p>
+                            <video id="streamVideo" autoplay muted style="width: 100%; border-radius: 8px; background: #000; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.5);"></video>
+                        </div>
+
+                        <div id="streamControls">
+                            <button onclick="startStream()" class="btn btn-danger btn-lg" id="startStreamBtn">
+                                <i class="fas fa-broadcast-tower"></i> Yayını Başlat
+                            </button>
+                            <button onclick="endStream()" class="btn btn-secondary btn-lg" id="endStreamBtn" style="display: none;">
+                                <i class="fas fa-stop"></i> Yayını Bitir
+                            </button>
+                        </div>
+                    </div>
+
+                    <div class="live-streams">
+                        <h3>Canlı Yayınlar</h3>
+                        <div id="liveStreams" class="streams-grid">
+                            <div class="empty-state">
+                                <i class="fas fa-tv"></i>
+                                <p>Şu anda canlı yayın yok</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Stats Tab -->
+            <div class="tab-content" id="stats-tab">
+                <div class="content-header">
+                    <h2><i class="fas fa-chart-bar"></i> İstatistikler</h2>
+                    <button class="btn btn-secondary" onclick="refreshStats()">
+                        <i class="fas fa-sync"></i> Yenile
+                    </button>
+                </div>
+                
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon chat">
+                            <i class="fas fa-comments"></i>
+                        </div>
+                        <div class="stat-info">
+                            <h3 id="statMessages">0</h3>
+                            <p>Toplam Mesaj</p>
+                        </div>
+                    </div>
+                    
+                    <div class="stat-card">
+                        <div class="stat-icon voice">
+                            <i class="fas fa-phone"></i>
+                        </div>
+                        <div class="stat-info">
+                            <h3 id="statVoiceCalls">0</h3>
+                            <p>Sesli Aramalar</p>
+                        </div>
+                    </div>
+                    
+                    <div class="stat-card">
+                        <div class="stat-icon video">
+                            <i class="fas fa-video"></i>
+                        </div>
+                        <div class="stat-info">
+                            <h3 id="statVideoCalls">0</h3>
+                            <p>Video Aramaları</p>
+                        </div>
+                    </div>
+                    
+                    <div class="stat-card">
+                        <div class="stat-icon stream">
+                            <i class="fas fa-broadcast-tower"></i>
+                        </div>
+                        <div class="stat-info">
+                            <h3 id="statStreams">0</h3>
+                            <p>Canlı Yayınlar</p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="server-info">
+                    <h3>Sunucu Bilgileri</h3>
+                    <div class="info-grid" id="serverInfo">
+                        <div class="info-item">
+                            <strong>Durum:</strong>
+                            <span class="text-success">Çalışıyor</span>
+                        </div>
+                        <div class="info-item">
+                            <strong>Versiyon:</strong>
+                            <span>2.0.0</span>
+                        </div>
+                        <div class="info-item">
+                            <strong>Adres:</strong>
+                            <span>http://localhost:8080</span>
+                        </div>
+                        <div class="info-item">
+                            <strong>Son Güncelleme:</strong>
+                            <span id="lastUpdate">-</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Notification Container -->
+    <div id="notifications"></div>
+
+    <script src="app.js"></script>
+</body>
+</html>

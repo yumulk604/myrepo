@@ -1,0 +1,148 @@
+name: Media CI
+
+on:
+  push:
+    paths:
+      - "media_server.cpp"
+      - "test_event_bus_multi_instance.ps1"
+      - ".github/workflows/media-ci.yml"
+  pull_request:
+    paths:
+      - "media_server.cpp"
+      - "test_event_bus_multi_instance.ps1"
+      - ".github/workflows/media-ci.yml"
+  workflow_dispatch:
+
+jobs:
+  build-and-eventbus-test:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install websocket-client
+
+      - name: Build media server
+        run: |
+          g++ -std=c++17 media_server.cpp -o media_server -O2 -pthread -ldl
+
+      - name: Run multi-instance Redis propagation test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup() {
+            if [[ -n "${PID_A:-}" ]]; then kill "$PID_A" 2>/dev/null || true; fi
+            if [[ -n "${PID_B:-}" ]]; then kill "$PID_B" 2>/dev/null || true; fi
+          }
+          trap cleanup EXIT
+
+          export GIGACHAD_EVENT_BUS=redis
+          export GIGACHAD_REDIS_HOST=127.0.0.1
+          export GIGACHAD_REDIS_PORT=6379
+          export GIGACHAD_EVENT_BUS_CHANNEL=gagabunto.media.ci.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}
+          export GIGACHAD_API_TOKEN=
+          export GIGACHAD_WS_TOKEN=
+
+          GIGACHAD_SERVER_PORT=18081 ./media_server >server_a.log 2>&1 &
+          PID_A=$!
+          GIGACHAD_SERVER_PORT=18082 ./media_server >server_b.log 2>&1 &
+          PID_B=$!
+
+          python - <<'PY'
+          import json
+          import time
+          import urllib.request
+          import urllib.error
+          from websocket import create_connection, WebSocketTimeoutException
+
+          def wait_health(port, timeout=25):
+            end = time.time() + timeout
+            url = f"http://127.0.0.1:{port}/api/health"
+            last = None
+            while time.time() < end:
+              try:
+                with urllib.request.urlopen(url, timeout=2) as r:
+                  body = r.read().decode("utf-8")
+                data = json.loads(body)
+                last = data
+                if data.get("status") == "healthy" and data.get("eventBusMode") == "redis":
+                  return
+              except Exception:
+                pass
+              time.sleep(0.5)
+            raise RuntimeError(f"health timeout port={port} last={last}")
+
+          wait_health(18081)
+          wait_health(18082)
+
+          room = "redis-room"
+          marker = f"ci-marker-{int(time.time()*1000)}"
+
+          ws = create_connection(f"ws://127.0.0.1:18082/ws?room={room}&user=ci-listener", timeout=5)
+          ws.settimeout(5)
+          try:
+            try:
+              ws.recv()
+            except Exception:
+              pass
+
+            payload = json.dumps({"username":"ci", "content":marker, "roomId":room}).encode("utf-8")
+            req = urllib.request.Request(
+              "http://127.0.0.1:18081/api/chat/messages",
+              data=payload,
+              method="POST",
+              headers={"Content-Type":"application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as r:
+              if r.status not in (200, 201):
+                raise RuntimeError(f"post failed status={r.status}")
+
+            deadline = time.time() + 20
+            while time.time() < deadline:
+              try:
+                frame = ws.recv()
+              except WebSocketTimeoutException:
+                continue
+              if not frame:
+                continue
+              try:
+                ev = json.loads(frame)
+              except Exception:
+                continue
+              if ev.get("type") == "chat.message.created" and ev.get("roomId") == room:
+                p = ev.get("payload") or {}
+                if p.get("content") == marker:
+                  print("PASS: cross-instance redis event propagation")
+                  break
+            else:
+              raise RuntimeError("did not receive cross-instance chat.message.created")
+          finally:
+            ws.close()
+          PY
+
+      - name: Dump logs on failure
+        if: failure()
+        run: |
+          echo "----- server_a.log -----"
+          cat server_a.log || true
+          echo "----- server_b.log -----"
+          cat server_b.log || true

@@ -1,0 +1,15 @@
+{
+  "name": "media-server-launcher",
+  "version": "1.0.0",
+  "description": "Launcher for Media Server",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "electron": "^33.2.1"
+  }
+}

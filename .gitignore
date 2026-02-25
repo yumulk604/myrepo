@@ -1,0 +1,48 @@
+# Build directories
+build/
+cmake-build-*/
+
+# Compiled binaries
+*.exe
+*.out
+*.app
+*.dll
+*.so
+*.dylib
+*.obj
+*.o
+
+# Downloaded dependencies
+httplib.h
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Backups and temp artifacts
+*.bak
+*.bak.*
+_tmp*
+*.tmp
+
+# Dependency directories
+node_modules/
+launcher/node_modules/
+
+# Local env backups (can contain secrets)
+environment_variables_backup.json
+environment_variables_backup.txt
+
+# Runtime data and local outputs
+data/
+server_log.txt
