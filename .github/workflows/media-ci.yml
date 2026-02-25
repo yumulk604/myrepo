@@ -7,6 +7,8 @@ on:
       - "test_event_bus_multi_instance.ps1"
       - "test_auth.ps1"
       - "test_ws_jwt_tenant.ps1"
+      - "test_auth_passkey.ps1"
+      - "test_auth_passkey_persistence.ps1"
       - ".github/workflows/media-ci.yml"
   pull_request:
     paths:
@@ -14,6 +16,8 @@ on:
       - "test_event_bus_multi_instance.ps1"
       - "test_auth.ps1"
       - "test_ws_jwt_tenant.ps1"
+      - "test_auth_passkey.ps1"
+      - "test_auth_passkey_persistence.ps1"
       - ".github/workflows/media-ci.yml"
   workflow_dispatch:
 
@@ -344,6 +348,259 @@ jobs:
           print("PASS: jwt auth + ws tenant enforcement")
           PY
 
+      - name: Run passkey phase-1 auth flow test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup() {
+            if [[ -n "${PID_PASSKEY:-}" ]]; then kill "$PID_PASSKEY" 2>/dev/null || true; fi
+          }
+          trap cleanup EXIT
+
+          export GIGACHAD_EVENT_BUS=memory
+          export GIGACHAD_JWT_SECRET=ci_passkey_secret_key
+          export GIGACHAD_API_TOKEN=
+          export GIGACHAD_WS_TOKEN=
+
+          GIGACHAD_SERVER_PORT=18381 ./media_server >passkey_server.log 2>&1 &
+          PID_PASSKEY=$!
+
+          python - <<'PY'
+          import json
+          import time
+          import urllib.request
+          import urllib.error
+
+          PORT = 18381
+          BASE = f"http://127.0.0.1:{PORT}"
+
+          def wait_health(timeout=25):
+            end = time.time() + timeout
+            while time.time() < end:
+              try:
+                with urllib.request.urlopen(f"{BASE}/api/health", timeout=2) as r:
+                  data = json.loads(r.read().decode("utf-8"))
+                if data.get("status") == "healthy":
+                  return
+              except Exception:
+                pass
+              time.sleep(0.5)
+            raise RuntimeError("passkey server health timeout")
+
+          def post(path, payload, headers=None):
+            body = json.dumps(payload).encode("utf-8")
+            h = {"Content-Type": "application/json"}
+            if headers:
+              h.update(headers)
+            req = urllib.request.Request(f"{BASE}{path}", data=body, method="POST", headers=h)
+            with urllib.request.urlopen(req, timeout=5) as r:
+              return json.loads(r.read().decode("utf-8"))
+
+          wait_health()
+
+          username = "ci-passkey"
+          tenant = "tenant-ci-passkey"
+          credential_id = "ci-cred-1"
+          rp_id = "localhost"
+          origin = "https://localhost"
+
+          ch_register = post("/api/auth/passkey/challenge", {
+            "username": username,
+            "flow": "register",
+            "role": "moderator",
+            "tenantId": tenant,
+            "rpId": rp_id,
+            "origin": origin
+          })
+          post("/api/auth/passkey/register", {
+            "username": username,
+            "challengeId": ch_register["challengeId"],
+            "challenge": ch_register["challenge"],
+            "credentialId": credential_id,
+            "publicKey": "ci-public-key",
+            "signCount": 1,
+            "rpId": rp_id,
+            "origin": origin,
+            "clientDataType": "webauthn.create"
+          })
+
+          ch_login = post("/api/auth/passkey/challenge", {
+            "username": username,
+            "flow": "login",
+            "tenantId": tenant,
+            "rpId": rp_id,
+            "origin": origin
+          })
+          login = post("/api/auth/passkey/login", {
+            "username": username,
+            "challengeId": ch_login["challengeId"],
+            "challenge": ch_login["challenge"],
+            "credentialId": credential_id,
+            "signCount": 2,
+            "rpId": rp_id,
+            "origin": origin,
+            "clientDataType": "webauthn.get"
+          })
+          token = login.get("accessToken", "")
+          if not token:
+            raise RuntimeError("passkey login did not return access token")
+          if login.get("tenantId") != tenant:
+            raise RuntimeError("passkey login tenant mismatch")
+          if login.get("role") != "moderator":
+            raise RuntimeError("passkey login role mismatch")
+
+          created = post("/api/chat/messages", {
+            "username": username,
+            "content": "ci-passkey-check",
+            "roomId": "passkey-room",
+            "tenantId": "wrong-tenant"
+          }, headers={"Authorization": f"Bearer {token}"})
+          if created.get("tenantId") != tenant:
+            raise RuntimeError("passkey jwt tenant enforcement failed")
+
+          try:
+            post("/api/auth/passkey/login", {
+              "username": username,
+              "challengeId": ch_login["challengeId"],
+              "challenge": ch_login["challenge"],
+              "credentialId": credential_id,
+              "signCount": 3,
+              "rpId": rp_id,
+              "origin": origin,
+              "clientDataType": "webauthn.get"
+            })
+            raise RuntimeError("challenge reuse was not blocked")
+          except urllib.error.HTTPError as e:
+            if e.code != 401:
+              raise
+
+          print("PASS: passkey phase-1 auth flow")
+          PY
+
+      - name: Run passkey credential persistence test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup() {
+            if [[ -n "${PID_PASSKEY_P1:-}" ]]; then kill "$PID_PASSKEY_P1" 2>/dev/null || true; fi
+            if [[ -n "${PID_PASSKEY_P2:-}" ]]; then kill "$PID_PASSKEY_P2" 2>/dev/null || true; fi
+          }
+          trap cleanup EXIT
+
+          export GIGACHAD_EVENT_BUS=memory
+          export GIGACHAD_JWT_SECRET=ci_passkey_persist_secret
+          export GIGACHAD_API_TOKEN=
+          export GIGACHAD_WS_TOKEN=
+
+          python - <<'PY'
+          import json
+          import time
+          import urllib.request
+          import subprocess
+          import os
+          import signal
+
+          PORT = 18391
+          BASE = f"http://127.0.0.1:{PORT}"
+          env = os.environ.copy()
+          env["GIGACHAD_SERVER_PORT"] = str(PORT)
+          env["MEDIA_SERVER_PORT"] = str(PORT)
+
+          def wait_health(timeout=25):
+            end = time.time() + timeout
+            while time.time() < end:
+              try:
+                with urllib.request.urlopen(f"{BASE}/api/health", timeout=2) as r:
+                  data = json.loads(r.read().decode("utf-8"))
+                if data.get("status") == "healthy":
+                  return
+              except Exception:
+                pass
+              time.sleep(0.5)
+            raise RuntimeError("passkey persistence health timeout")
+
+          def post(path, payload, headers=None):
+            body = json.dumps(payload).encode("utf-8")
+            h = {"Content-Type": "application/json"}
+            if headers:
+              h.update(headers)
+            req = urllib.request.Request(f"{BASE}{path}", data=body, method="POST", headers=h)
+            with urllib.request.urlopen(req, timeout=5) as r:
+              return json.loads(r.read().decode("utf-8"))
+
+          p1 = subprocess.Popen(["./media_server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+          try:
+            wait_health()
+            username = "ci-passkey-persist"
+            tenant = "tenant-ci-passkey-persist"
+            credential_id = "ci-persist-cred-1"
+            rp_id = "localhost"
+            origin = "https://localhost"
+
+            ch_register = post("/api/auth/passkey/challenge", {
+              "username": username,
+              "flow": "register",
+              "tenantId": tenant,
+              "rpId": rp_id,
+              "origin": origin
+            })
+            post("/api/auth/passkey/register", {
+              "username": username,
+              "challengeId": ch_register["challengeId"],
+              "challenge": ch_register["challenge"],
+              "credentialId": credential_id,
+              "publicKey": "ci-persist-public-key",
+              "signCount": 1,
+              "rpId": rp_id,
+              "origin": origin,
+              "clientDataType": "webauthn.create"
+            })
+          finally:
+            p1.terminate()
+            try:
+              p1.wait(timeout=5)
+            except Exception:
+              p1.kill()
+
+          p2 = subprocess.Popen(["./media_server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+          try:
+            wait_health()
+            username = "ci-passkey-persist"
+            tenant = "tenant-ci-passkey-persist"
+            credential_id = "ci-persist-cred-1"
+            rp_id = "localhost"
+            origin = "https://localhost"
+
+            ch_login = post("/api/auth/passkey/challenge", {
+              "username": username,
+              "flow": "login",
+              "tenantId": tenant,
+              "rpId": rp_id,
+              "origin": origin
+            })
+            login = post("/api/auth/passkey/login", {
+              "username": username,
+              "challengeId": ch_login["challengeId"],
+              "challenge": ch_login["challenge"],
+              "credentialId": credential_id,
+              "signCount": 2,
+              "rpId": rp_id,
+              "origin": origin,
+              "clientDataType": "webauthn.get"
+            })
+            if not login.get("accessToken"):
+              raise RuntimeError("restart sonrası passkey access token yok")
+            if login.get("tenantId") != tenant:
+              raise RuntimeError("restart sonrası passkey tenant mismatch")
+            print("PASS: passkey credential persistence")
+          finally:
+            p2.terminate()
+            try:
+              p2.wait(timeout=5)
+            except Exception:
+              p2.kill()
+          PY
+
       - name: Dump logs on failure
         if: failure()
         run: |
@@ -357,3 +614,5 @@ jobs:
           cat tenant_b.log || true
           echo "----- jwt_server.log -----"
           cat jwt_server.log || true
+          echo "----- passkey_server.log -----"
+          cat passkey_server.log || true

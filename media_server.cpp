@@ -220,6 +220,7 @@ const std::string kMessagesFile = "data/messages.jsonl";
 const std::string kCallsFile = "data/calls.jsonl";
 const std::string kStreamsFile = "data/streams.jsonl";
 const std::string kRecordingsFile = "data/recordings.jsonl";
+const std::string kPasskeysFile = "data/passkeys.jsonl";
 const std::string kSqliteDbFile = "data/media.db";
 
 std::string detectStorageMode() {
@@ -413,9 +414,34 @@ std::unordered_set<std::string> g_revokedRefreshTokenJti;
 std::unordered_set<std::string> g_revokedAccessTokenJti;
 std::mutex g_auth_mutex;
 
+struct PasskeyCredential {
+    std::string credentialId;
+    std::string publicKey;
+    int signCount = 0;
+    std::string role;
+    std::string tenantId;
+    std::string createdAt;
+};
+
+struct PasskeyChallengeState {
+    std::string challenge;
+    std::string username;
+    std::string role;
+    std::string tenantId;
+    std::string rpId;
+    std::string flow; // register | login
+    int expiresAt = 0;
+};
+
+std::map<std::string, std::vector<PasskeyCredential>> g_passkeyCredentialsByUser;
+std::unordered_map<std::string, PasskeyChallengeState> g_passkeyChallenges;
+
 // ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
+std::string escapeJSONString(const std::string& s);
+std::string trimWhitespace(const std::string& input);
+std::string toLower(std::string s);
 
 std::string getCurrentTimestamp() {
     auto now = std::chrono::system_clock::now();
@@ -676,11 +702,23 @@ bool initSqliteStorage() {
         "exp INTEGER,"
         "revokedAt TEXT"
         ");";
+    const std::string createPasskeyCredentialsSql =
+        "CREATE TABLE IF NOT EXISTS passkey_credentials ("
+        "username TEXT,"
+        "credentialId TEXT,"
+        "publicKey TEXT,"
+        "signCount INTEGER DEFAULT 0,"
+        "role TEXT,"
+        "tenantId TEXT,"
+        "createdAt TEXT,"
+        "PRIMARY KEY(username, credentialId)"
+        ");";
     bool ok = sqliteExec(db, createMessagesSql) &&
               sqliteExec(db, createCallsSql) &&
               sqliteExec(db, createStreamsSql) &&
               sqliteExec(db, createRecordingsSql) &&
-              sqliteExec(db, createRevokedTokensSql);
+              sqliteExec(db, createRevokedTokensSql) &&
+              sqliteExec(db, createPasskeyCredentialsSql);
     if (ok) {
         sqliteExec(db, "ALTER TABLE messages ADD COLUMN tenantId TEXT DEFAULT 'default';");
     }
@@ -1434,6 +1472,196 @@ void loadRecordingsFromDisk() {
     }
 }
 
+bool persistPasskeyCredentialsSnapshotToSqlite(const std::map<std::string, std::vector<PasskeyCredential>>& snapshot) {
+    if (!g_sqliteReady && !initSqliteStorage()) return false;
+
+    std::lock_guard<std::mutex> lock(sqlite_mutex);
+    sqlite3* db = nullptr;
+    if (p_sqlite3_open(kSqliteDbFile.c_str(), &db) != SQLITE_OK || db == nullptr) {
+        if (db) p_sqlite3_close(db);
+        return false;
+    }
+
+    if (!sqliteExec(db, "BEGIN TRANSACTION;")) {
+        p_sqlite3_close(db);
+        return false;
+    }
+    if (!sqliteExec(db, "DELETE FROM passkey_credentials;")) {
+        sqliteExec(db, "ROLLBACK;");
+        p_sqlite3_close(db);
+        return false;
+    }
+
+    const char* insertSql =
+        "INSERT INTO passkey_credentials(username, credentialId, publicKey, signCount, role, tenantId, createdAt) "
+        "VALUES(?, ?, ?, ?, ?, ?, ?);";
+    sqlite3_stmt* stmt = nullptr;
+    if (p_sqlite3_prepare_v2(db, insertSql, -1, &stmt, nullptr) != SQLITE_OK || stmt == nullptr) {
+        sqliteExec(db, "ROLLBACK;");
+        p_sqlite3_close(db);
+        return false;
+    }
+
+    bool ok = true;
+    auto transient = reinterpret_cast<void(*)(void*)>(-1);
+    for (const auto& kv : snapshot) {
+        const std::string& username = kv.first;
+        for (const auto& cred : kv.second) {
+            std::string signCountText = std::to_string(cred.signCount);
+            if (p_sqlite3_bind_text(stmt, 1, username.c_str(), -1, transient) != SQLITE_OK ||
+                p_sqlite3_bind_text(stmt, 2, cred.credentialId.c_str(), -1, transient) != SQLITE_OK ||
+                p_sqlite3_bind_text(stmt, 3, cred.publicKey.c_str(), -1, transient) != SQLITE_OK ||
+                p_sqlite3_bind_text(stmt, 4, signCountText.c_str(), -1, transient) != SQLITE_OK ||
+                p_sqlite3_bind_text(stmt, 5, cred.role.c_str(), -1, transient) != SQLITE_OK ||
+                p_sqlite3_bind_text(stmt, 6, cred.tenantId.c_str(), -1, transient) != SQLITE_OK ||
+                p_sqlite3_bind_text(stmt, 7, cred.createdAt.c_str(), -1, transient) != SQLITE_OK) {
+                ok = false;
+                break;
+            }
+            int rc = p_sqlite3_step(stmt);
+            if (rc != SQLITE_DONE) {
+                ok = false;
+                break;
+            }
+            p_sqlite3_reset(stmt);
+            p_sqlite3_clear_bindings(stmt);
+        }
+        if (!ok) break;
+    }
+
+    p_sqlite3_finalize(stmt);
+    if (ok) ok = sqliteExec(db, "COMMIT;");
+    else sqliteExec(db, "ROLLBACK;");
+    p_sqlite3_close(db);
+    return ok;
+}
+
+bool persistPasskeyCredentialsToSqlite() {
+    std::map<std::string, std::vector<PasskeyCredential>> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(g_auth_mutex);
+        snapshot = g_passkeyCredentialsByUser;
+    }
+    return persistPasskeyCredentialsSnapshotToSqlite(snapshot);
+}
+
+bool persistPasskeyCredentialsSnapshotToDisk(const std::map<std::string, std::vector<PasskeyCredential>>& snapshot) {
+    std::vector<std::string> lines;
+    for (const auto& kv : snapshot) {
+        const std::string& username = kv.first;
+        for (const auto& cred : kv.second) {
+            lines.push_back(
+                "{"
+                "\"username\":\"" + escapeJSONString(username) + "\","
+                "\"credentialId\":\"" + escapeJSONString(cred.credentialId) + "\","
+                "\"publicKey\":\"" + escapeJSONString(cred.publicKey) + "\","
+                "\"signCount\":" + std::to_string(std::max(0, cred.signCount)) + ","
+                "\"role\":\"" + escapeJSONString(cred.role) + "\","
+                "\"tenantId\":\"" + escapeJSONString(normalizeTenantId(cred.tenantId)) + "\","
+                "\"createdAt\":\"" + escapeJSONString(cred.createdAt) + "\""
+                "}"
+            );
+        }
+    }
+    return writeLinesToFile(kPasskeysFile, lines);
+}
+
+bool persistPasskeyCredentialsToDisk() {
+    std::map<std::string, std::vector<PasskeyCredential>> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(g_auth_mutex);
+        snapshot = g_passkeyCredentialsByUser;
+    }
+    return persistPasskeyCredentialsSnapshotToDisk(snapshot);
+}
+
+void loadPasskeyCredentialsFromSqlite() {
+    if (!g_sqliteReady && !initSqliteStorage()) return;
+
+    std::lock_guard<std::mutex> lock(sqlite_mutex);
+    sqlite3* db = nullptr;
+    if (p_sqlite3_open(kSqliteDbFile.c_str(), &db) != SQLITE_OK || db == nullptr) {
+        if (db) p_sqlite3_close(db);
+        return;
+    }
+
+    const char* sql =
+        "SELECT username, credentialId, publicKey, COALESCE(signCount, 0), COALESCE(role, 'user'), "
+        "COALESCE(tenantId, 'default'), COALESCE(createdAt, '') "
+        "FROM passkey_credentials ORDER BY rowid ASC;";
+    sqlite3_stmt* stmt = nullptr;
+    if (p_sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK || stmt == nullptr) {
+        p_sqlite3_close(db);
+        return;
+    }
+
+    std::map<std::string, std::vector<PasskeyCredential>> loaded;
+    while (true) {
+        int rc = p_sqlite3_step(stmt);
+        if (rc == SQLITE_DONE) break;
+        if (rc != SQLITE_ROW) break;
+
+        const unsigned char* c0 = p_sqlite3_column_text(stmt, 0);
+        const unsigned char* c1 = p_sqlite3_column_text(stmt, 1);
+        const unsigned char* c2 = p_sqlite3_column_text(stmt, 2);
+        const unsigned char* c3 = p_sqlite3_column_text(stmt, 3);
+        const unsigned char* c4 = p_sqlite3_column_text(stmt, 4);
+        const unsigned char* c5 = p_sqlite3_column_text(stmt, 5);
+        const unsigned char* c6 = p_sqlite3_column_text(stmt, 6);
+
+        std::string username = c0 ? reinterpret_cast<const char*>(c0) : "";
+        std::string credentialId = c1 ? reinterpret_cast<const char*>(c1) : "";
+        if (username.empty() || credentialId.empty()) {
+            continue;
+        }
+
+        PasskeyCredential cred;
+        cred.credentialId = credentialId;
+        cred.publicKey = c2 ? reinterpret_cast<const char*>(c2) : "";
+        cred.signCount = std::max(0, c3 ? std::atoi(reinterpret_cast<const char*>(c3)) : 0);
+        cred.role = c4 ? reinterpret_cast<const char*>(c4) : "user";
+        cred.tenantId = normalizeTenantId(c5 ? reinterpret_cast<const char*>(c5) : "default");
+        cred.createdAt = c6 ? reinterpret_cast<const char*>(c6) : "";
+        loaded[username].push_back(cred);
+    }
+
+    p_sqlite3_finalize(stmt);
+    p_sqlite3_close(db);
+
+    {
+        std::lock_guard<std::mutex> authLock(g_auth_mutex);
+        g_passkeyCredentialsByUser = std::move(loaded);
+    }
+}
+
+void loadPasskeyCredentialsFromDisk() {
+    std::map<std::string, std::vector<PasskeyCredential>> loaded;
+    auto lines = readLinesFromFile(kPasskeysFile);
+    for (const auto& line : lines) {
+        const std::string username = trimWhitespace(extractJSONValue(line, "username"));
+        const std::string credentialId = trimWhitespace(extractJSONValue(line, "credentialId"));
+        if (username.empty() || credentialId.empty()) {
+            continue;
+        }
+
+        PasskeyCredential cred;
+        cred.credentialId = credentialId;
+        cred.publicKey = extractJSONValue(line, "publicKey");
+        cred.signCount = std::max(0, extractJSONIntValue(line, "signCount", 0));
+        cred.role = toLower(trimWhitespace(extractJSONValue(line, "role")));
+        if (cred.role != "admin" && cred.role != "moderator" && cred.role != "user") {
+            cred.role = "user";
+        }
+        cred.tenantId = normalizeTenantId(extractJSONValue(line, "tenantId"));
+        cred.createdAt = extractJSONValue(line, "createdAt");
+        loaded[username].push_back(cred);
+    }
+    {
+        std::lock_guard<std::mutex> authLock(g_auth_mutex);
+        g_passkeyCredentialsByUser = std::move(loaded);
+    }
+}
+
 bool persistRevokedTokenJtiToSqlite(const std::string& tokenType, const std::string& jti, int exp) {
     if (jti.empty()) return false;
     if (!g_sqliteReady && !initSqliteStorage()) return false;
@@ -1517,6 +1745,16 @@ void loadPersistedData() {
     loadStreamsFromDisk();
     loadRecordingsFromDisk();
     loadRevokedTokenJtiFromSqlite();
+    loadPasskeyCredentialsFromSqlite();
+    bool hasPasskeys = false;
+    {
+        std::lock_guard<std::mutex> lock(g_auth_mutex);
+        hasPasskeys = !g_passkeyCredentialsByUser.empty();
+    }
+    if (!hasPasskeys) {
+        loadPasskeyCredentialsFromDisk();
+        persistPasskeyCredentialsToSqlite();
+    }
 }
 
 int getEnvInt(const char* name, int defaultValue) {
@@ -1923,6 +2161,79 @@ bool tryParseAndValidateJwt(const std::string& token, AuthContext& outCtx) {
 
     outCtx.valid = true;
     return true;
+}
+
+int passkeyChallengeTtlSec() {
+    static const int ttl = getEnvIntWithFallback("GIGACHAD_PASSKEY_CHALLENGE_TTL_SEC", "MEDIA_PASSKEY_CHALLENGE_TTL_SEC", 120);
+    return ttl > 0 ? ttl : 120;
+}
+
+bool passkeyStrictMetadataEnabled() {
+    static const int strictValue = getEnvIntWithFallback("GIGACHAD_PASSKEY_STRICT_METADATA", "MEDIA_PASSKEY_STRICT_METADATA", 1);
+    return strictValue != 0;
+}
+
+std::string passkeyRpId() {
+    static const std::string rpId = trimWhitespace(getEnvStringWithFallback("GIGACHAD_PASSKEY_RP_ID", "MEDIA_PASSKEY_RP_ID", ""));
+    return rpId;
+}
+
+std::vector<std::string> splitCsvTrimmed(const std::string& raw) {
+    std::vector<std::string> out;
+    std::stringstream ss(raw);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        std::string normalized = trimWhitespace(item);
+        if (!normalized.empty()) {
+            out.push_back(normalized);
+        }
+    }
+    return out;
+}
+
+const std::vector<std::string>& passkeyAllowedOrigins() {
+    static const std::vector<std::string> origins = []() {
+        std::string raw = trimWhitespace(getEnvStringWithFallback("GIGACHAD_PASSKEY_ALLOWED_ORIGINS", "MEDIA_PASSKEY_ALLOWED_ORIGINS", ""));
+        if (raw.empty()) {
+            return std::vector<std::string>{};
+        }
+        return splitCsvTrimmed(raw);
+    }();
+    return origins;
+}
+
+bool isPasskeyOriginAllowed(const std::string& origin) {
+    const auto& allowed = passkeyAllowedOrigins();
+    if (allowed.empty()) {
+        return true;
+    }
+    for (const auto& candidate : allowed) {
+        if (candidate == origin) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string generatePasskeyChallenge() {
+    std::array<uint8_t, 24> bytes{};
+    static std::random_device rd;
+    static std::mt19937 gen(rd());
+    static std::uniform_int_distribution<int> dis(0, 255);
+    for (auto& b : bytes) {
+        b = static_cast<uint8_t>(dis(gen));
+    }
+    return base64UrlEncode(bytes.data(), bytes.size());
+}
+
+void cleanupExpiredPasskeyChallengesLocked(int now) {
+    for (auto it = g_passkeyChallenges.begin(); it != g_passkeyChallenges.end();) {
+        if (it->second.expiresAt <= now) {
+            it = g_passkeyChallenges.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 std::string escapeJSONString(const std::string& s) {
@@ -2746,6 +3057,325 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
         return res;
     }
 
+    if (req.method == "POST" && routePath == "/api/auth/passkey/challenge") {
+        std::string username = trimWhitespace(extractJSONValue(req.body, "username"));
+        if (username.empty()) {
+            username = trimWhitespace(extractJSONValue(req.body, "user"));
+        }
+        if (username.empty()) {
+            res.status = 400;
+            res.statusText = "Bad Request";
+            res.body = "{\"error\":\"Missing username\"}";
+            return res;
+        }
+
+        std::string flow = toLower(trimWhitespace(extractJSONValue(req.body, "flow")));
+        if (flow != "register" && flow != "login") {
+            flow = "login";
+        }
+
+        std::string role = toLower(trimWhitespace(extractJSONValue(req.body, "role")));
+        if (role != "admin" && role != "moderator" && role != "user") {
+            role = "user";
+        }
+        const std::string tenantId = normalizeTenantId(extractJSONValue(req.body, "tenantId"));
+        const std::string rpId = !passkeyRpId().empty() ? passkeyRpId() : trimWhitespace(extractJSONValue(req.body, "rpId"));
+        std::string origin = trimWhitespace(extractJSONValue(req.body, "origin"));
+        if (origin.empty()) {
+            origin = trimWhitespace(getHeaderValue(req.headers, "Origin"));
+        }
+        if (!origin.empty() && !isPasskeyOriginAllowed(origin)) {
+            res.status = 403;
+            res.statusText = "Forbidden";
+            res.body = "{\"error\":\"Origin is not allowed for passkey flow\"}";
+            return res;
+        }
+
+        const std::string challengeId = generateId("pk_ch_");
+        const std::string challenge = generatePasskeyChallenge();
+        const int ttlSec = passkeyChallengeTtlSec();
+        const int expiresAt = nowEpochSec() + ttlSec;
+
+        {
+            std::lock_guard<std::mutex> lock(g_auth_mutex);
+            cleanupExpiredPasskeyChallengesLocked(nowEpochSec());
+            g_passkeyChallenges[challengeId] = PasskeyChallengeState{
+                challenge,
+                username,
+                role,
+                tenantId,
+                rpId,
+                flow,
+                expiresAt
+            };
+        }
+
+        res.body =
+            "{"
+            "\"challengeId\":\"" + escapeJSONString(challengeId) + "\","
+            "\"challenge\":\"" + escapeJSONString(challenge) + "\","
+            "\"username\":\"" + escapeJSONString(username) + "\","
+            "\"flow\":\"" + escapeJSONString(flow) + "\","
+            "\"tenantId\":\"" + escapeJSONString(tenantId) + "\","
+            "\"rpId\":\"" + escapeJSONString(rpId) + "\","
+            "\"strictMetadata\":" + std::string(passkeyStrictMetadataEnabled() ? "true" : "false") + ","
+            "\"expiresIn\":" + std::to_string(ttlSec) +
+            "}";
+        return res;
+    }
+
+    if (req.method == "POST" && routePath == "/api/auth/passkey/register") {
+        const std::string challengeId = trimWhitespace(extractJSONValue(req.body, "challengeId"));
+        const std::string challenge = trimWhitespace(extractJSONValue(req.body, "challenge"));
+        std::string username = trimWhitespace(extractJSONValue(req.body, "username"));
+        if (username.empty()) username = trimWhitespace(extractJSONValue(req.body, "user"));
+        const std::string credentialId = trimWhitespace(extractJSONValue(req.body, "credentialId"));
+        const std::string publicKey = trimWhitespace(extractJSONValue(req.body, "publicKey"));
+        int signCount = extractJSONIntValue(req.body, "signCount", 0);
+        if (signCount < 0) signCount = 0;
+        std::string role = toLower(trimWhitespace(extractJSONValue(req.body, "role")));
+        if (role != "admin" && role != "moderator" && role != "user") {
+            role = "user";
+        }
+        std::string tenantId = normalizeTenantId(extractJSONValue(req.body, "tenantId"));
+        const std::string reqRpId = trimWhitespace(extractJSONValue(req.body, "rpId"));
+        std::string reqOrigin = trimWhitespace(extractJSONValue(req.body, "origin"));
+        if (reqOrigin.empty()) reqOrigin = trimWhitespace(getHeaderValue(req.headers, "Origin"));
+        const std::string clientDataType = trimWhitespace(extractJSONValue(req.body, "clientDataType"));
+
+        if (challengeId.empty() || challenge.empty() || username.empty() || credentialId.empty() || publicKey.empty()) {
+            res.status = 400;
+            res.statusText = "Bad Request";
+            res.body = "{\"error\":\"Missing required fields\"}";
+            return res;
+        }
+        if (passkeyStrictMetadataEnabled()) {
+            if (reqRpId.empty() || reqOrigin.empty() || clientDataType.empty()) {
+                res.status = 400;
+                res.statusText = "Bad Request";
+                res.body = "{\"error\":\"Missing strict passkey metadata: rpId/origin/clientDataType\"}";
+                return res;
+            }
+            if (clientDataType != "webauthn.create") {
+                res.status = 400;
+                res.statusText = "Bad Request";
+                res.body = "{\"error\":\"Invalid clientDataType for register\"}";
+                return res;
+            }
+            if (!isPasskeyOriginAllowed(reqOrigin)) {
+                res.status = 403;
+                res.statusText = "Forbidden";
+                res.body = "{\"error\":\"Origin is not allowed for passkey flow\"}";
+                return res;
+            }
+        }
+
+        const int now = nowEpochSec();
+        bool credentialChanged = false;
+        {
+            std::lock_guard<std::mutex> lock(g_auth_mutex);
+            cleanupExpiredPasskeyChallengesLocked(now);
+            auto it = g_passkeyChallenges.find(challengeId);
+            if (it == g_passkeyChallenges.end()) {
+                res.status = 401;
+                res.statusText = "Unauthorized";
+                res.body = "{\"error\":\"Invalid or expired challenge\"}";
+                return res;
+            }
+            const PasskeyChallengeState challengeState = it->second;
+            if (challengeState.flow != "register" ||
+                challengeState.challenge != challenge ||
+                challengeState.username != username ||
+                challengeState.expiresAt <= now) {
+                g_passkeyChallenges.erase(it);
+                res.status = 401;
+                res.statusText = "Unauthorized";
+                res.body = "{\"error\":\"Challenge verification failed\"}";
+                return res;
+            }
+            if (passkeyStrictMetadataEnabled()) {
+                if (!challengeState.rpId.empty() && challengeState.rpId != reqRpId) {
+                    g_passkeyChallenges.erase(it);
+                    res.status = 401;
+                    res.statusText = "Unauthorized";
+                    res.body = "{\"error\":\"rpId mismatch\"}";
+                    return res;
+                }
+            }
+            g_passkeyChallenges.erase(it);
+
+            if (tenantId == "default") {
+                tenantId = normalizeTenantId(challengeState.tenantId);
+            }
+            if (role == "user" && challengeState.role == "admin") {
+                role = "admin";
+            } else if (role == "user" && challengeState.role == "moderator") {
+                role = "moderator";
+            }
+
+            auto& creds = g_passkeyCredentialsByUser[username];
+            auto credIt = std::find_if(creds.begin(), creds.end(), [&](const PasskeyCredential& c) {
+                return c.credentialId == credentialId;
+            });
+            if (credIt == creds.end()) {
+                PasskeyCredential cred;
+                cred.credentialId = credentialId;
+                cred.publicKey = publicKey;
+                cred.signCount = signCount;
+                cred.role = role;
+                cred.tenantId = tenantId;
+                cred.createdAt = getCurrentTimestamp();
+                creds.push_back(cred);
+                credentialChanged = true;
+            } else {
+                credIt->publicKey = publicKey;
+                credIt->signCount = std::max(credIt->signCount, signCount);
+                credIt->role = role;
+                credIt->tenantId = tenantId;
+                credentialChanged = true;
+            }
+        }
+        if (credentialChanged) {
+            persistPasskeyCredentialsToSqlite();
+            persistPasskeyCredentialsToDisk();
+        }
+
+        res.body =
+            "{"
+            "\"status\":\"registered\","
+            "\"username\":\"" + escapeJSONString(username) + "\","
+            "\"credentialId\":\"" + escapeJSONString(credentialId) + "\","
+            "\"role\":\"" + escapeJSONString(role) + "\","
+            "\"tenantId\":\"" + escapeJSONString(tenantId) + "\","
+            "\"rpId\":\"" + escapeJSONString(reqRpId) + "\","
+            "\"origin\":\"" + escapeJSONString(reqOrigin) + "\","
+            "\"note\":\"phase1_strict_metadata_no_webauthn_signature_verification\""
+            "}";
+        return res;
+    }
+
+    if (req.method == "POST" && routePath == "/api/auth/passkey/login") {
+        const std::string challengeId = trimWhitespace(extractJSONValue(req.body, "challengeId"));
+        const std::string challenge = trimWhitespace(extractJSONValue(req.body, "challenge"));
+        std::string username = trimWhitespace(extractJSONValue(req.body, "username"));
+        if (username.empty()) username = trimWhitespace(extractJSONValue(req.body, "user"));
+        const std::string credentialId = trimWhitespace(extractJSONValue(req.body, "credentialId"));
+        int signCount = extractJSONIntValue(req.body, "signCount", -1);
+        const std::string reqRpId = trimWhitespace(extractJSONValue(req.body, "rpId"));
+        std::string reqOrigin = trimWhitespace(extractJSONValue(req.body, "origin"));
+        if (reqOrigin.empty()) reqOrigin = trimWhitespace(getHeaderValue(req.headers, "Origin"));
+        const std::string clientDataType = trimWhitespace(extractJSONValue(req.body, "clientDataType"));
+
+        if (challengeId.empty() || challenge.empty() || username.empty() || credentialId.empty()) {
+            res.status = 400;
+            res.statusText = "Bad Request";
+            res.body = "{\"error\":\"Missing required fields\"}";
+            return res;
+        }
+        if (passkeyStrictMetadataEnabled()) {
+            if (reqRpId.empty() || reqOrigin.empty() || clientDataType.empty()) {
+                res.status = 400;
+                res.statusText = "Bad Request";
+                res.body = "{\"error\":\"Missing strict passkey metadata: rpId/origin/clientDataType\"}";
+                return res;
+            }
+            if (clientDataType != "webauthn.get") {
+                res.status = 400;
+                res.statusText = "Bad Request";
+                res.body = "{\"error\":\"Invalid clientDataType for login\"}";
+                return res;
+            }
+            if (!isPasskeyOriginAllowed(reqOrigin)) {
+                res.status = 403;
+                res.statusText = "Forbidden";
+                res.body = "{\"error\":\"Origin is not allowed for passkey flow\"}";
+                return res;
+            }
+        }
+
+        PasskeyCredential selected;
+        bool found = false;
+        bool signCountChanged = false;
+        const int now = nowEpochSec();
+        {
+            std::lock_guard<std::mutex> lock(g_auth_mutex);
+            cleanupExpiredPasskeyChallengesLocked(now);
+            auto challengeIt = g_passkeyChallenges.find(challengeId);
+            if (challengeIt == g_passkeyChallenges.end()) {
+                res.status = 401;
+                res.statusText = "Unauthorized";
+                res.body = "{\"error\":\"Invalid or expired challenge\"}";
+                return res;
+            }
+            const PasskeyChallengeState challengeState = challengeIt->second;
+            if (challengeState.flow != "login" ||
+                challengeState.challenge != challenge ||
+                challengeState.username != username ||
+                challengeState.expiresAt <= now) {
+                g_passkeyChallenges.erase(challengeIt);
+                res.status = 401;
+                res.statusText = "Unauthorized";
+                res.body = "{\"error\":\"Challenge verification failed\"}";
+                return res;
+            }
+            if (passkeyStrictMetadataEnabled()) {
+                if (!challengeState.rpId.empty() && challengeState.rpId != reqRpId) {
+                    g_passkeyChallenges.erase(challengeIt);
+                    res.status = 401;
+                    res.statusText = "Unauthorized";
+                    res.body = "{\"error\":\"rpId mismatch\"}";
+                    return res;
+                }
+            }
+            g_passkeyChallenges.erase(challengeIt);
+
+            auto userCredsIt = g_passkeyCredentialsByUser.find(username);
+            if (userCredsIt != g_passkeyCredentialsByUser.end()) {
+                auto& creds = userCredsIt->second;
+                auto credIt = std::find_if(creds.begin(), creds.end(), [&](const PasskeyCredential& c) {
+                    return c.credentialId == credentialId;
+                });
+                if (credIt != creds.end()) {
+                    if (signCount < 0) {
+                        signCount = credIt->signCount + 1;
+                    }
+                    if (signCount <= credIt->signCount) {
+                        signCount = credIt->signCount + 1;
+                    }
+                    credIt->signCount = signCount;
+                    selected = *credIt;
+                    found = true;
+                    signCountChanged = true;
+                }
+            }
+        }
+        if (signCountChanged) {
+            persistPasskeyCredentialsToSqlite();
+            persistPasskeyCredentialsToDisk();
+        }
+
+        if (!found) {
+            res.status = 401;
+            res.statusText = "Unauthorized";
+            res.body = "{\"error\":\"Passkey credential not found\"}";
+            return res;
+        }
+
+        const std::string accessToken = buildJwtToken("access", username, selected.role, selected.tenantId, jwtAccessTtlSec());
+        const std::string refreshToken = buildJwtToken("refresh", username, selected.role, selected.tenantId, jwtRefreshTtlSec());
+        res.body =
+            "{"
+            "\"tokenType\":\"Bearer\","
+            "\"accessToken\":\"" + escapeJSONString(accessToken) + "\","
+            "\"refreshToken\":\"" + escapeJSONString(refreshToken) + "\","
+            "\"expiresIn\":" + std::to_string(jwtAccessTtlSec()) + ","
+            "\"role\":\"" + escapeJSONString(selected.role) + "\","
+            "\"tenantId\":\"" + escapeJSONString(selected.tenantId) + "\","
+            "\"username\":\"" + escapeJSONString(username) + "\""
+            "}";
+        return res;
+    }
+
     if (req.method == "POST" && routePath == "/api/auth/login") {
         const std::string gateToken = trimWhitespace(getEnvStringWithFallback("GIGACHAD_AUTH_LOGIN_TOKEN", "MEDIA_AUTH_LOGIN_TOKEN", ""));
         if (!gateToken.empty()) {
@@ -3428,7 +4058,8 @@ void sendHttpErrorResponse(int clientSocket, int code, const std::string& status
 
 bool isPublicApiPath(const std::string& routePath) {
     return routePath == "/api" || routePath == "/api/health" ||
-           routePath == "/api/auth/login" || routePath == "/api/auth/refresh" || routePath == "/api/auth/logout";
+           routePath == "/api/auth/login" || routePath == "/api/auth/refresh" || routePath == "/api/auth/logout" ||
+           routePath == "/api/auth/passkey/challenge" || routePath == "/api/auth/passkey/register" || routePath == "/api/auth/passkey/login";
 }
 
 bool isApiTokenProtectionEnabled() {
@@ -3753,10 +4384,16 @@ HTTPResponse handleRequest(const HTTPRequest& req) {
       "POST /api/auth/login": "Issue access+refresh JWT",
       "POST /api/auth/refresh": "Rotate refresh and issue new tokens",
       "POST /api/auth/logout": "Revoke provided token jti",
+      "POST /api/auth/passkey/challenge": "Create short-lived challenge for register/login",
+      "POST /api/auth/passkey/register": "Phase-1 passkey registration (minimal, no signature verify)",
+      "POST /api/auth/passkey/login": "Phase-1 passkey login and JWT issue",
       "Role tokens (optional)": [
         "GIGACHAD_MOD_TOKEN / MEDIA_MOD_TOKEN",
         "GIGACHAD_ADMIN_TOKEN / MEDIA_ADMIN_TOKEN"
-      ]
+      ],
+      "Passkey challenge TTL env": "GIGACHAD_PASSKEY_CHALLENGE_TTL_SEC or MEDIA_PASSKEY_CHALLENGE_TTL_SEC",
+      "Passkey RP/Origin env": "GIGACHAD_PASSKEY_RP_ID + GIGACHAD_PASSKEY_ALLOWED_ORIGINS (MEDIA_* aliases)",
+      "Passkey strict metadata env": "GIGACHAD_PASSKEY_STRICT_METADATA or MEDIA_PASSKEY_STRICT_METADATA"
     },
     "Realtime": {
       "GET /ws?room={roomId}&user={userId}&tenant={tenantId}&token={token}": "WebSocket event stream"
