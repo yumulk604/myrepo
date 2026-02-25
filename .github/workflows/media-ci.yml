@@ -9,6 +9,7 @@ on:
       - "test_ws_jwt_tenant.ps1"
       - "test_auth_passkey.ps1"
       - "test_auth_passkey_persistence.ps1"
+      - "test_auth_passkey_rate_limit.ps1"
       - ".github/workflows/media-ci.yml"
   pull_request:
     paths:
@@ -18,6 +19,7 @@ on:
       - "test_ws_jwt_tenant.ps1"
       - "test_auth_passkey.ps1"
       - "test_auth_passkey_persistence.ps1"
+      - "test_auth_passkey_rate_limit.ps1"
       - ".github/workflows/media-ci.yml"
   workflow_dispatch:
 
@@ -780,6 +782,79 @@ jobs:
               p2.kill()
           PY
 
+      - name: Run passkey rate-limit test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup() {
+            if [[ -n "${PID_PASSKEY_RL:-}" ]]; then kill "$PID_PASSKEY_RL" 2>/dev/null || true; fi
+          }
+          trap cleanup EXIT
+
+          export GIGACHAD_EVENT_BUS=memory
+          export GIGACHAD_JWT_SECRET=ci_passkey_rate_secret
+          export GIGACHAD_API_TOKEN=
+          export GIGACHAD_WS_TOKEN=
+          export GIGACHAD_PASSKEY_RATE_MAX_ATTEMPTS=2
+          export GIGACHAD_PASSKEY_RATE_WINDOW_SEC=60
+
+          GIGACHAD_SERVER_PORT=18401 ./media_server >passkey_rate_server.log 2>&1 &
+          PID_PASSKEY_RL=$!
+
+          python - <<'PY'
+          import json
+          import time
+          import urllib.request
+          import urllib.error
+
+          PORT = 18401
+          BASE = f"http://127.0.0.1:{PORT}"
+
+          def wait_health(timeout=25):
+            end = time.time() + timeout
+            while time.time() < end:
+              try:
+                with urllib.request.urlopen(f"{BASE}/api/health", timeout=2) as r:
+                  data = json.loads(r.read().decode("utf-8"))
+                if data.get("status") == "healthy":
+                  return
+              except Exception:
+                pass
+              time.sleep(0.5)
+            raise RuntimeError("passkey rate-limit health timeout")
+
+          def post(path, payload):
+            body = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+              f"{BASE}{path}",
+              data=body,
+              method="POST",
+              headers={"Content-Type":"application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as r:
+              return json.loads(r.read().decode("utf-8"))
+
+          wait_health()
+          payload = {
+            "username": "ci-rl-user",
+            "flow": "login",
+            "tenantId": "tenant-ci-rl",
+            "rpId": "localhost",
+            "origin": "https://localhost"
+          }
+          blocked = False
+          for _ in range(20):
+            try:
+              post("/api/auth/passkey/challenge", payload)
+            except urllib.error.HTTPError as e:
+              if e.code == 429:
+                blocked = True
+                break
+          if not blocked:
+            raise RuntimeError("passkey rate-limit did not return 429 within 20 attempts")
+          print("PASS: passkey rate-limit")
+          PY
+
       - name: Dump logs on failure
         if: failure()
         run: |
@@ -795,3 +870,5 @@ jobs:
           cat jwt_server.log || true
           echo "----- passkey_server.log -----"
           cat passkey_server.log || true
+          echo "----- passkey_rate_server.log -----"
+          cat passkey_rate_server.log || true

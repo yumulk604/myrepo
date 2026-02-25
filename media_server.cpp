@@ -214,6 +214,8 @@ std::vector<WebSocketClient> wsClients;
 std::mutex ws_mutex;
 std::unordered_map<std::string, std::deque<std::chrono::steady_clock::time_point>> wsConnectionAttempts;
 std::mutex ws_rate_mutex;
+std::unordered_map<std::string, std::deque<std::chrono::steady_clock::time_point>> passkeyAttempts;
+std::mutex passkey_rate_mutex;
 
 const std::string kDataDir = "data";
 const std::string kMessagesFile = "data/messages.jsonl";
@@ -442,6 +444,7 @@ std::unordered_map<std::string, PasskeyChallengeState> g_passkeyChallenges;
 std::string escapeJSONString(const std::string& s);
 std::string trimWhitespace(const std::string& input);
 std::string toLower(std::string s);
+std::string getHeaderValue(const std::map<std::string, std::string>& headers, const std::string& key);
 
 std::string getCurrentTimestamp() {
     auto now = std::chrono::system_clock::now();
@@ -2220,6 +2223,41 @@ bool isPasskeyOriginAllowed(const std::string& origin) {
     return false;
 }
 
+std::string firstIpFromCsv(const std::string& value) {
+    size_t comma = value.find(',');
+    if (comma == std::string::npos) return trimWhitespace(value);
+    return trimWhitespace(value.substr(0, comma));
+}
+
+std::string resolveClientIpFromHeaders(const std::map<std::string, std::string>& headers) {
+    std::string ip = firstIpFromCsv(getHeaderValue(headers, "X-Forwarded-For"));
+    if (!ip.empty()) return ip;
+    ip = trimWhitespace(getHeaderValue(headers, "X-Real-IP"));
+    if (!ip.empty()) return ip;
+    return "unknown";
+}
+
+bool consumePasskeyRateLimit(const std::string& clientIp, const std::string& usernameRaw) {
+    static const int windowSeconds = getEnvIntWithFallback("GIGACHAD_PASSKEY_RATE_WINDOW_SEC", "MEDIA_PASSKEY_RATE_WINDOW_SEC", 60);
+    static const int maxAttempts = getEnvIntWithFallback("GIGACHAD_PASSKEY_RATE_MAX_ATTEMPTS", "MEDIA_PASSKEY_RATE_MAX_ATTEMPTS", 12);
+    const std::string username = toLower(trimWhitespace(usernameRaw));
+    const std::string key = clientIp + "|" + (username.empty() ? "-" : username);
+
+    const auto now = std::chrono::steady_clock::now();
+    const auto cutoff = now - std::chrono::seconds(windowSeconds);
+
+    std::lock_guard<std::mutex> lock(passkey_rate_mutex);
+    auto& attempts = passkeyAttempts[key];
+    while (!attempts.empty() && attempts.front() < cutoff) {
+        attempts.pop_front();
+    }
+    if (static_cast<int>(attempts.size()) >= maxAttempts) {
+        return false;
+    }
+    attempts.push_back(now);
+    return true;
+}
+
 std::vector<uint8_t> base64UrlDecodeToBytes(const std::string& in) {
     std::string decoded = base64UrlDecodeToString(in);
     if (decoded.empty() && !in.empty()) {
@@ -3193,6 +3231,17 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
         res.statusText = "Bad Request";
         res.body = "{\"error\":\"JWT auth is disabled. Set GIGACHAD_JWT_SECRET or MEDIA_JWT_SECRET.\"}";
         return res;
+    }
+
+    if (routePath.find("/api/auth/passkey/") == 0) {
+        std::string username = trimWhitespace(extractJSONValue(req.body, "username"));
+        if (username.empty()) username = trimWhitespace(extractJSONValue(req.body, "user"));
+        if (!consumePasskeyRateLimit(resolveClientIpFromHeaders(req.headers), username)) {
+            res.status = 429;
+            res.statusText = "Too Many Requests";
+            res.body = "{\"error\":\"Passkey rate limit exceeded\"}";
+            return res;
+        }
     }
 
     if (req.method == "POST" && routePath == "/api/auth/passkey/challenge") {
@@ -4596,7 +4645,8 @@ HTTPResponse handleRequest(const HTTPRequest& req) {
       "Passkey challenge TTL env": "GIGACHAD_PASSKEY_CHALLENGE_TTL_SEC or MEDIA_PASSKEY_CHALLENGE_TTL_SEC",
       "Passkey RP/Origin env": "GIGACHAD_PASSKEY_RP_ID + GIGACHAD_PASSKEY_ALLOWED_ORIGINS (MEDIA_* aliases)",
       "Passkey strict metadata env": "GIGACHAD_PASSKEY_STRICT_METADATA or MEDIA_PASSKEY_STRICT_METADATA",
-      "Passkey counter policy env": "GIGACHAD_PASSKEY_COUNTER_STRICT or MEDIA_PASSKEY_COUNTER_STRICT"
+      "Passkey counter policy env": "GIGACHAD_PASSKEY_COUNTER_STRICT or MEDIA_PASSKEY_COUNTER_STRICT",
+      "Passkey rate-limit env": "GIGACHAD_PASSKEY_RATE_MAX_ATTEMPTS + GIGACHAD_PASSKEY_RATE_WINDOW_SEC (MEDIA_* aliases)"
     },
     "Realtime": {
       "GET /ws?room={roomId}&user={userId}&tenant={tenantId}&token={token}": "WebSocket event stream"
@@ -4699,6 +4749,9 @@ void handleClient(int clientSocket, const std::string& clientIp) {
     if (bytesRead > 0) {
         std::string requestStr(buffer, bytesRead);
         HTTPRequest req = parseRequest(requestStr);
+        if (getHeaderValue(req.headers, "X-Real-IP").empty()) {
+            req.headers["X-Real-IP"] = clientIp;
+        }
 
         if (isWebSocketUpgradeRequest(req)) {
             std::cout << req.method << " " << req.path << " - 101" << std::endl;
