@@ -41,6 +41,7 @@
 - [+] Realtime Core: Passkey strict metadata kontrolleri eklendi (rpId/origin/clientDataType + allowlist policy).
 - [+] Realtime Core: Passkey challenge bagli clientDataJSON ve authenticatorData (rpIdHash + UP flag + signCount) kontrolu eklendi.
 - [+] Realtime Core: Passkey login icin credential-bound HMAC signature verification eklendi (strict mode).
+- [+] Realtime Core: Passkey counter rollback/replay korumasi eklendi (GIGACHAD_PASSKEY_COUNTER_STRICT).
 - [+] Realtime Core: Passkey credential persistence eklendi (SQLite + disk fallback, restart sonrasi login devam).
 - [-] Realtime Core: Passkey tam WebAuthn COSE public-key (ECDSA/EdDSA) signature verification (production hardening).
 
@@ -82,6 +83,7 @@
 - [+] Passkey env policy eklendi: GIGACHAD_PASSKEY_RP_ID, GIGACHAD_PASSKEY_ALLOWED_ORIGINS, GIGACHAD_PASSKEY_STRICT_METADATA
 - [+] test_auth_passkey_persistence.ps1 eklendi ve PASS alindi (restart sonrasi passkey login)
 - [+] CI pipeline'a passkey credential persistence test adimi eklendi.
+- [+] Passkey negatif testleri genisletildi (bad signature + signCount rollback bloklama).
 
 
 

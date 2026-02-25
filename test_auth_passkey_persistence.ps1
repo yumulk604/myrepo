@@ -97,6 +97,12 @@ function Start-TestServer {
         MEDIA_EVENT_BUS = "memory"
         GIGACHAD_API_TOKEN = ""
         MEDIA_API_TOKEN = ""
+        GIGACHAD_PASSKEY_STRICT_METADATA = "1"
+        MEDIA_PASSKEY_STRICT_METADATA = "1"
+        GIGACHAD_PASSKEY_COUNTER_STRICT = "1"
+        MEDIA_PASSKEY_COUNTER_STRICT = "1"
+        GIGACHAD_STORAGE_MODE = "hybrid"
+        MEDIA_STORAGE_MODE = "hybrid"
     }
     return Start-Process -FilePath $exePath -WorkingDirectory $projectRoot -PassThru -WindowStyle Hidden -Environment $childEnv
 }
@@ -104,9 +110,10 @@ function Start-TestServer {
 $s1 = $null
 $s2 = $null
 try {
-    $username = "persist-passkey-user"
+    $runId = Get-Date -Format "yyyyMMddHHmmssfff"
+    $username = "persist-passkey-user-$runId"
     $tenantId = "tenant-passkey-persist"
-    $credentialId = "cred-persist-001"
+    $credentialId = "cred-persist-$runId"
     $publicKey = "persist-key"
     $rpId = "localhost"
     $origin = "https://localhost"

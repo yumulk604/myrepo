@@ -100,6 +100,12 @@ try {
         MEDIA_EVENT_BUS = "memory"
         GIGACHAD_API_TOKEN = ""
         MEDIA_API_TOKEN = ""
+        GIGACHAD_PASSKEY_STRICT_METADATA = "1"
+        MEDIA_PASSKEY_STRICT_METADATA = "1"
+        GIGACHAD_PASSKEY_COUNTER_STRICT = "1"
+        MEDIA_PASSKEY_COUNTER_STRICT = "1"
+        GIGACHAD_STORAGE_MODE = "hybrid"
+        MEDIA_STORAGE_MODE = "hybrid"
     }
 
     $server = Start-Process -FilePath $exePath -WorkingDirectory $projectRoot -PassThru -WindowStyle Hidden -Environment $childEnv
@@ -107,9 +113,10 @@ try {
         throw "Server hazir degil."
     }
 
-    $username = "passkey-user"
+    $runId = Get-Date -Format "yyyyMMddHHmmssfff"
+    $username = "passkey-user-$runId"
     $tenantId = "tenant-passkey"
-    $credentialId = "cred-passkey-001"
+    $credentialId = "cred-passkey-$runId"
     $publicKey = "pk_test_material"
     $rpId = "localhost"
     $origin = "https://localhost"
@@ -174,6 +181,64 @@ try {
     $created = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $Port + "/api/chat/messages") -Method Post -ContentType "application/json" -Headers @{ Authorization = ("Bearer " + $login.accessToken) } -Body $chatBody
     if ($created.tenantId -ne $tenantId) {
         throw "JWT tenant enforcement calismadi."
+    }
+
+    $badSigChallenge = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $Port + "/api/auth/passkey/challenge") -Method Post -ContentType "application/json" -Body $loginChallengeBody
+    $badSigClientDataJson = (@{ type = "webauthn.get"; challenge = $badSigChallenge.challenge; origin = $origin } | ConvertTo-Json -Compress)
+    $badSigClientDataB64 = Convert-ToBase64Url -Bytes ([System.Text.Encoding]::UTF8.GetBytes($badSigClientDataJson))
+    $badSigAuthData = Get-AuthenticatorDataB64 -RpId $rpId -SignCount 3
+    $badSig = Get-SignatureB64 -CredentialKey "wrong-secret" -AuthenticatorDataB64 $badSigAuthData -ClientDataJson $badSigClientDataJson
+    $badSigBody = @{
+        username = $username
+        challengeId = $badSigChallenge.challengeId
+        challenge = $badSigChallenge.challenge
+        credentialId = $credentialId
+        signCount = 3
+        rpId = $rpId
+        origin = $origin
+        clientDataType = "webauthn.get"
+        clientDataJSON = $badSigClientDataB64
+        authenticatorData = $badSigAuthData
+        signature = $badSig
+    } | ConvertTo-Json -Compress
+
+    $badSigBlocked = $false
+    try {
+        Invoke-RestMethod -Uri ("http://127.0.0.1:" + $Port + "/api/auth/passkey/login") -Method Post -ContentType "application/json" -Body $badSigBody | Out-Null
+    } catch {
+        $badSigBlocked = $true
+    }
+    if (-not $badSigBlocked) {
+        throw "Invalid signature engellenmedi."
+    }
+
+    $rollbackChallenge = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $Port + "/api/auth/passkey/challenge") -Method Post -ContentType "application/json" -Body $loginChallengeBody
+    $rollbackClientDataJson = (@{ type = "webauthn.get"; challenge = $rollbackChallenge.challenge; origin = $origin } | ConvertTo-Json -Compress)
+    $rollbackClientDataB64 = Convert-ToBase64Url -Bytes ([System.Text.Encoding]::UTF8.GetBytes($rollbackClientDataJson))
+    $rollbackAuthData = Get-AuthenticatorDataB64 -RpId $rpId -SignCount 2
+    $rollbackSig = Get-SignatureB64 -CredentialKey $publicKey -AuthenticatorDataB64 $rollbackAuthData -ClientDataJson $rollbackClientDataJson
+    $rollbackBody = @{
+        username = $username
+        challengeId = $rollbackChallenge.challengeId
+        challenge = $rollbackChallenge.challenge
+        credentialId = $credentialId
+        signCount = 2
+        rpId = $rpId
+        origin = $origin
+        clientDataType = "webauthn.get"
+        clientDataJSON = $rollbackClientDataB64
+        authenticatorData = $rollbackAuthData
+        signature = $rollbackSig
+    } | ConvertTo-Json -Compress
+
+    $rollbackBlocked = $false
+    try {
+        Invoke-RestMethod -Uri ("http://127.0.0.1:" + $Port + "/api/auth/passkey/login") -Method Post -ContentType "application/json" -Body $rollbackBody | Out-Null
+    } catch {
+        $rollbackBlocked = $true
+    }
+    if (-not $rollbackBlocked) {
+        throw "signCount rollback engellenmedi."
     }
 
     $reusedBlocked = $false

@@ -2173,6 +2173,11 @@ bool passkeyStrictMetadataEnabled() {
     return strictValue != 0;
 }
 
+bool passkeyCounterStrictEnabled() {
+    static const int strictValue = getEnvIntWithFallback("GIGACHAD_PASSKEY_COUNTER_STRICT", "MEDIA_PASSKEY_COUNTER_STRICT", 1);
+    return strictValue != 0;
+}
+
 std::string passkeyRpId() {
     static const std::string rpId = trimWhitespace(getEnvStringWithFallback("GIGACHAD_PASSKEY_RP_ID", "MEDIA_PASSKEY_RP_ID", ""));
     return rpId;
@@ -3522,6 +3527,16 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
                             res.body = "{\"error\":\"" + escapeJSONString(passkeyValidationError) + "\"}";
                             return res;
                         }
+                        if (passkeyCounterStrictEnabled()) {
+                            // Detect potential cloned authenticator or replay when counters are active.
+                            if (authDataSignCount > 0 && credIt->signCount > 0 && authDataSignCount <= credIt->signCount) {
+                                res.status = 401;
+                                res.statusText = "Unauthorized";
+                                res.body = "{\"error\":\"Passkey signCount rollback/replay detected\"}";
+                                return res;
+                            }
+                        }
+                        signCount = authDataSignCount;
                     }
                     if (signCount < 0) {
                         signCount = credIt->signCount + 1;
@@ -4580,7 +4595,8 @@ HTTPResponse handleRequest(const HTTPRequest& req) {
       ],
       "Passkey challenge TTL env": "GIGACHAD_PASSKEY_CHALLENGE_TTL_SEC or MEDIA_PASSKEY_CHALLENGE_TTL_SEC",
       "Passkey RP/Origin env": "GIGACHAD_PASSKEY_RP_ID + GIGACHAD_PASSKEY_ALLOWED_ORIGINS (MEDIA_* aliases)",
-      "Passkey strict metadata env": "GIGACHAD_PASSKEY_STRICT_METADATA or MEDIA_PASSKEY_STRICT_METADATA"
+      "Passkey strict metadata env": "GIGACHAD_PASSKEY_STRICT_METADATA or MEDIA_PASSKEY_STRICT_METADATA",
+      "Passkey counter policy env": "GIGACHAD_PASSKEY_COUNTER_STRICT or MEDIA_PASSKEY_COUNTER_STRICT"
     },
     "Realtime": {
       "GET /ws?room={roomId}&user={userId}&tenant={tenantId}&token={token}": "WebSocket event stream"
