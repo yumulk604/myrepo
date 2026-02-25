@@ -2215,6 +2215,139 @@ bool isPasskeyOriginAllowed(const std::string& origin) {
     return false;
 }
 
+std::vector<uint8_t> base64UrlDecodeToBytes(const std::string& in) {
+    std::string decoded = base64UrlDecodeToString(in);
+    if (decoded.empty() && !in.empty()) {
+        return {};
+    }
+    return std::vector<uint8_t>(decoded.begin(), decoded.end());
+}
+
+std::string decodePossiblyBase64UrlJson(const std::string& maybeB64OrJson) {
+    if (maybeB64OrJson.empty()) return "";
+    if (!maybeB64OrJson.empty() && maybeB64OrJson.front() == '{') {
+        return maybeB64OrJson;
+    }
+    return base64UrlDecodeToString(maybeB64OrJson);
+}
+
+bool constantTimeEqual(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+    if (a.size() != b.size()) return false;
+    uint8_t diff = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        diff |= static_cast<uint8_t>(a[i] ^ b[i]);
+    }
+    return diff == 0;
+}
+
+bool validatePasskeyClientData(
+    const std::string& clientDataJsonB64,
+    const std::string& expectedType,
+    const std::string& expectedChallenge,
+    const std::string& expectedOrigin,
+    std::string& errorReason
+) {
+    std::string clientDataJson = decodePossiblyBase64UrlJson(clientDataJsonB64);
+    if (clientDataJson.empty()) {
+        errorReason = "Invalid clientDataJSON";
+        return false;
+    }
+
+    const std::string gotType = trimWhitespace(extractJSONValue(clientDataJson, "type"));
+    const std::string gotChallenge = trimWhitespace(extractJSONValue(clientDataJson, "challenge"));
+    const std::string gotOrigin = trimWhitespace(extractJSONValue(clientDataJson, "origin"));
+    if (gotType != expectedType) {
+        errorReason = "clientDataJSON.type mismatch";
+        return false;
+    }
+    if (gotChallenge != expectedChallenge) {
+        errorReason = "clientDataJSON.challenge mismatch";
+        return false;
+    }
+    if (!expectedOrigin.empty() && gotOrigin != expectedOrigin) {
+        errorReason = "clientDataJSON.origin mismatch";
+        return false;
+    }
+    return true;
+}
+
+bool validatePasskeyAuthenticatorData(
+    const std::string& authenticatorDataB64,
+    const std::string& rpId,
+    int& signCountOut,
+    std::string& errorReason
+) {
+    const std::vector<uint8_t> authData = base64UrlDecodeToBytes(authenticatorDataB64);
+    if (authData.size() < 37) {
+        errorReason = "Invalid authenticatorData";
+        return false;
+    }
+
+    const auto rpHash = sha256(rpId);
+    for (size_t i = 0; i < rpHash.size(); ++i) {
+        if (authData[i] != rpHash[i]) {
+            errorReason = "authenticatorData.rpIdHash mismatch";
+            return false;
+        }
+    }
+
+    const uint8_t flags = authData[32];
+    if ((flags & 0x01) == 0) {
+        errorReason = "authenticatorData user presence flag missing";
+        return false;
+    }
+
+    signCountOut = (static_cast<int>(authData[33]) << 24) |
+                   (static_cast<int>(authData[34]) << 16) |
+                   (static_cast<int>(authData[35]) << 8) |
+                   static_cast<int>(authData[36]);
+    if (signCountOut < 0) signCountOut = 0;
+    return true;
+}
+
+bool validatePasskeySignatureHmac(
+    const std::string& credentialKey,
+    const std::string& authenticatorDataB64,
+    const std::string& clientDataJsonB64,
+    const std::string& signatureB64,
+    std::string& errorReason
+) {
+    if (credentialKey.empty()) {
+        errorReason = "Credential key is missing";
+        return false;
+    }
+
+    const std::vector<uint8_t> authData = base64UrlDecodeToBytes(authenticatorDataB64);
+    if (authData.empty()) {
+        errorReason = "Invalid authenticatorData for signature validation";
+        return false;
+    }
+    const std::string clientDataJson = decodePossiblyBase64UrlJson(clientDataJsonB64);
+    if (clientDataJson.empty()) {
+        errorReason = "Invalid clientDataJSON for signature validation";
+        return false;
+    }
+    const std::vector<uint8_t> providedSig = base64UrlDecodeToBytes(signatureB64);
+    if (providedSig.empty()) {
+        errorReason = "Invalid signature encoding";
+        return false;
+    }
+
+    const auto clientDataHash = sha256(clientDataJson);
+    std::string signingMessage;
+    signingMessage.reserve(authData.size() + clientDataHash.size());
+    signingMessage.append(reinterpret_cast<const char*>(authData.data()), authData.size());
+    signingMessage.append(reinterpret_cast<const char*>(clientDataHash.data()), clientDataHash.size());
+
+    const auto expectedSig = hmacSha256(credentialKey, signingMessage);
+    std::vector<uint8_t> expectedSigBytes(expectedSig.begin(), expectedSig.end());
+    if (!constantTimeEqual(expectedSigBytes, providedSig)) {
+        errorReason = "Signature verification failed";
+        return false;
+    }
+    return true;
+}
+
 std::string generatePasskeyChallenge() {
     std::array<uint8_t, 24> bytes{};
     static std::random_device rd;
@@ -3142,6 +3275,10 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
         std::string reqOrigin = trimWhitespace(extractJSONValue(req.body, "origin"));
         if (reqOrigin.empty()) reqOrigin = trimWhitespace(getHeaderValue(req.headers, "Origin"));
         const std::string clientDataType = trimWhitespace(extractJSONValue(req.body, "clientDataType"));
+        const std::string clientDataJsonB64 = trimWhitespace(extractJSONValue(req.body, "clientDataJSON"));
+        const std::string authenticatorDataB64 = trimWhitespace(extractJSONValue(req.body, "authenticatorData"));
+        int authDataSignCount = 0;
+        std::string passkeyValidationError;
 
         if (challengeId.empty() || challenge.empty() || username.empty() || credentialId.empty() || publicKey.empty()) {
             res.status = 400;
@@ -3150,10 +3287,11 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
             return res;
         }
         if (passkeyStrictMetadataEnabled()) {
-            if (reqRpId.empty() || reqOrigin.empty() || clientDataType.empty()) {
+            if (reqRpId.empty() || reqOrigin.empty() || clientDataType.empty() ||
+                clientDataJsonB64.empty() || authenticatorDataB64.empty()) {
                 res.status = 400;
                 res.statusText = "Bad Request";
-                res.body = "{\"error\":\"Missing strict passkey metadata: rpId/origin/clientDataType\"}";
+                res.body = "{\"error\":\"Missing strict passkey metadata: rpId/origin/clientDataType/clientDataJSON/authenticatorData\"}";
                 return res;
             }
             if (clientDataType != "webauthn.create") {
@@ -3167,6 +3305,21 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
                 res.statusText = "Forbidden";
                 res.body = "{\"error\":\"Origin is not allowed for passkey flow\"}";
                 return res;
+            }
+            if (!validatePasskeyClientData(clientDataJsonB64, "webauthn.create", challenge, reqOrigin, passkeyValidationError)) {
+                res.status = 401;
+                res.statusText = "Unauthorized";
+                res.body = "{\"error\":\"" + escapeJSONString(passkeyValidationError) + "\"}";
+                return res;
+            }
+            if (!validatePasskeyAuthenticatorData(authenticatorDataB64, reqRpId, authDataSignCount, passkeyValidationError)) {
+                res.status = 401;
+                res.statusText = "Unauthorized";
+                res.body = "{\"error\":\"" + escapeJSONString(passkeyValidationError) + "\"}";
+                return res;
+            }
+            if (signCount < authDataSignCount) {
+                signCount = authDataSignCount;
             }
         }
 
@@ -3249,7 +3402,7 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
             "\"tenantId\":\"" + escapeJSONString(tenantId) + "\","
             "\"rpId\":\"" + escapeJSONString(reqRpId) + "\","
             "\"origin\":\"" + escapeJSONString(reqOrigin) + "\","
-            "\"note\":\"phase1_strict_metadata_no_webauthn_signature_verification\""
+            "\"note\":\"phase2_clientdata_authdata_checks_no_signature_verification\""
             "}";
         return res;
     }
@@ -3265,6 +3418,11 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
         std::string reqOrigin = trimWhitespace(extractJSONValue(req.body, "origin"));
         if (reqOrigin.empty()) reqOrigin = trimWhitespace(getHeaderValue(req.headers, "Origin"));
         const std::string clientDataType = trimWhitespace(extractJSONValue(req.body, "clientDataType"));
+        const std::string clientDataJsonB64 = trimWhitespace(extractJSONValue(req.body, "clientDataJSON"));
+        const std::string authenticatorDataB64 = trimWhitespace(extractJSONValue(req.body, "authenticatorData"));
+        const std::string signatureB64 = trimWhitespace(extractJSONValue(req.body, "signature"));
+        int authDataSignCount = 0;
+        std::string passkeyValidationError;
 
         if (challengeId.empty() || challenge.empty() || username.empty() || credentialId.empty()) {
             res.status = 400;
@@ -3273,10 +3431,11 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
             return res;
         }
         if (passkeyStrictMetadataEnabled()) {
-            if (reqRpId.empty() || reqOrigin.empty() || clientDataType.empty()) {
+            if (reqRpId.empty() || reqOrigin.empty() || clientDataType.empty() ||
+                clientDataJsonB64.empty() || authenticatorDataB64.empty() || signatureB64.empty()) {
                 res.status = 400;
                 res.statusText = "Bad Request";
-                res.body = "{\"error\":\"Missing strict passkey metadata: rpId/origin/clientDataType\"}";
+                res.body = "{\"error\":\"Missing strict passkey metadata: rpId/origin/clientDataType/clientDataJSON/authenticatorData/signature\"}";
                 return res;
             }
             if (clientDataType != "webauthn.get") {
@@ -3290,6 +3449,21 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
                 res.statusText = "Forbidden";
                 res.body = "{\"error\":\"Origin is not allowed for passkey flow\"}";
                 return res;
+            }
+            if (!validatePasskeyClientData(clientDataJsonB64, "webauthn.get", challenge, reqOrigin, passkeyValidationError)) {
+                res.status = 401;
+                res.statusText = "Unauthorized";
+                res.body = "{\"error\":\"" + escapeJSONString(passkeyValidationError) + "\"}";
+                return res;
+            }
+            if (!validatePasskeyAuthenticatorData(authenticatorDataB64, reqRpId, authDataSignCount, passkeyValidationError)) {
+                res.status = 401;
+                res.statusText = "Unauthorized";
+                res.body = "{\"error\":\"" + escapeJSONString(passkeyValidationError) + "\"}";
+                return res;
+            }
+            if (signCount < 0 || signCount < authDataSignCount) {
+                signCount = authDataSignCount;
             }
         }
 
@@ -3336,6 +3510,19 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
                     return c.credentialId == credentialId;
                 });
                 if (credIt != creds.end()) {
+                    if (passkeyStrictMetadataEnabled()) {
+                        if (!validatePasskeySignatureHmac(
+                                credIt->publicKey,
+                                authenticatorDataB64,
+                                clientDataJsonB64,
+                                signatureB64,
+                                passkeyValidationError)) {
+                            res.status = 401;
+                            res.statusText = "Unauthorized";
+                            res.body = "{\"error\":\"" + escapeJSONString(passkeyValidationError) + "\"}";
+                            return res;
+                        }
+                    }
                     if (signCount < 0) {
                         signCount = credIt->signCount + 1;
                     }
@@ -4385,8 +4572,8 @@ HTTPResponse handleRequest(const HTTPRequest& req) {
       "POST /api/auth/refresh": "Rotate refresh and issue new tokens",
       "POST /api/auth/logout": "Revoke provided token jti",
       "POST /api/auth/passkey/challenge": "Create short-lived challenge for register/login",
-      "POST /api/auth/passkey/register": "Phase-1 passkey registration (minimal, no signature verify)",
-      "POST /api/auth/passkey/login": "Phase-1 passkey login and JWT issue",
+      "POST /api/auth/passkey/register": "Passkey register with strict clientData/authenticatorData checks",
+      "POST /api/auth/passkey/login": "Passkey login with strict metadata + credential-bound signature verification and JWT issue",
       "Role tokens (optional)": [
         "GIGACHAD_MOD_TOKEN / MEDIA_MOD_TOKEN",
         "GIGACHAD_ADMIN_TOKEN / MEDIA_ADMIN_TOKEN"

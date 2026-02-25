@@ -396,6 +396,50 @@ jobs:
             with urllib.request.urlopen(req, timeout=5) as r:
               return json.loads(r.read().decode("utf-8"))
 
+          def b64url(data: bytes) -> str:
+            import base64
+            return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+          def build_auth_data(rp_id: str, sign_count: int) -> str:
+            import hashlib
+            rp_hash = hashlib.sha256(rp_id.encode("utf-8")).digest()
+            flags = bytes([0x01])  # user present
+            counter = int(sign_count).to_bytes(4, byteorder="big", signed=False)
+            return b64url(rp_hash + flags + counter)
+
+          def build_signature(credential_key: str, auth_data_b64: str, client_data_json: str) -> str:
+            import base64
+            import hashlib
+            import hmac
+            pad = '=' * ((4 - (len(auth_data_b64) % 4)) % 4)
+            auth_data = base64.urlsafe_b64decode((auth_data_b64 + pad).encode("ascii"))
+            client_hash = hashlib.sha256(client_data_json.encode("utf-8")).digest()
+            payload = auth_data + client_hash
+            sig = hmac.new(credential_key.encode("utf-8"), payload, hashlib.sha256).digest()
+            return b64url(sig)
+
+          def build_signature(credential_key: str, auth_data_b64: str, client_data_json: str) -> str:
+            import base64
+            import hashlib
+            import hmac
+            pad = '=' * ((4 - (len(auth_data_b64) % 4)) % 4)
+            auth_data = base64.urlsafe_b64decode((auth_data_b64 + pad).encode("ascii"))
+            client_hash = hashlib.sha256(client_data_json.encode("utf-8")).digest()
+            payload = auth_data + client_hash
+            sig = hmac.new(credential_key.encode("utf-8"), payload, hashlib.sha256).digest()
+            return b64url(sig)
+
+          def b64url(data: bytes) -> str:
+            import base64
+            return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+          def build_auth_data(rp_id: str, sign_count: int) -> str:
+            import hashlib
+            rp_hash = hashlib.sha256(rp_id.encode("utf-8")).digest()
+            flags = bytes([0x01])  # user present
+            counter = int(sign_count).to_bytes(4, byteorder="big", signed=False)
+            return b64url(rp_hash + flags + counter)
+
           wait_health()
 
           username = "ci-passkey"
@@ -421,7 +465,13 @@ jobs:
             "signCount": 1,
             "rpId": rp_id,
             "origin": origin,
-            "clientDataType": "webauthn.create"
+            "clientDataType": "webauthn.create",
+            "clientDataJSON": b64url(json.dumps({
+              "type": "webauthn.create",
+              "challenge": ch_register["challenge"],
+              "origin": origin
+            }, separators=(",", ":")).encode("utf-8")),
+            "authenticatorData": build_auth_data(rp_id, 1)
           })
 
           ch_login = post("/api/auth/passkey/challenge", {
@@ -439,7 +489,18 @@ jobs:
             "signCount": 2,
             "rpId": rp_id,
             "origin": origin,
-            "clientDataType": "webauthn.get"
+            "clientDataType": "webauthn.get",
+            "clientDataJSON": b64url(json.dumps({
+              "type": "webauthn.get",
+              "challenge": ch_login["challenge"],
+              "origin": origin
+            }, separators=(",", ":")).encode("utf-8")),
+            "authenticatorData": build_auth_data(rp_id, 2),
+            "signature": build_signature(
+              "ci-public-key",
+              build_auth_data(rp_id, 2),
+              json.dumps({"type": "webauthn.get", "challenge": ch_login["challenge"], "origin": origin}, separators=(",", ":"))
+            )
           })
           token = login.get("accessToken", "")
           if not token:
@@ -467,7 +528,18 @@ jobs:
               "signCount": 3,
               "rpId": rp_id,
               "origin": origin,
-              "clientDataType": "webauthn.get"
+              "clientDataType": "webauthn.get",
+              "clientDataJSON": b64url(json.dumps({
+                "type": "webauthn.get",
+                "challenge": ch_login["challenge"],
+                "origin": origin
+              }, separators=(",", ":")).encode("utf-8")),
+              "authenticatorData": build_auth_data(rp_id, 3),
+              "signature": build_signature(
+                "ci-public-key",
+                build_auth_data(rp_id, 3),
+                json.dumps({"type": "webauthn.get", "challenge": ch_login["challenge"], "origin": origin}, separators=(",", ":"))
+              )
             })
             raise RuntimeError("challenge reuse was not blocked")
           except urllib.error.HTTPError as e:
@@ -553,7 +625,13 @@ jobs:
               "signCount": 1,
               "rpId": rp_id,
               "origin": origin,
-              "clientDataType": "webauthn.create"
+              "clientDataType": "webauthn.create",
+              "clientDataJSON": b64url(json.dumps({
+                "type": "webauthn.create",
+                "challenge": ch_register["challenge"],
+                "origin": origin
+              }, separators=(",", ":")).encode("utf-8")),
+              "authenticatorData": build_auth_data(rp_id, 1)
             })
           finally:
             p1.terminate()
@@ -586,7 +664,18 @@ jobs:
               "signCount": 2,
               "rpId": rp_id,
               "origin": origin,
-              "clientDataType": "webauthn.get"
+              "clientDataType": "webauthn.get",
+              "clientDataJSON": b64url(json.dumps({
+                "type": "webauthn.get",
+                "challenge": ch_login["challenge"],
+                "origin": origin
+              }, separators=(",", ":")).encode("utf-8")),
+              "authenticatorData": build_auth_data(rp_id, 2),
+              "signature": build_signature(
+                "ci-persist-public-key",
+                build_auth_data(rp_id, 2),
+                json.dumps({"type": "webauthn.get", "challenge": ch_login["challenge"], "origin": origin}, separators=(",", ":"))
+              )
             })
             if not login.get("accessToken"):
               raise RuntimeError("restart sonrası passkey access token yok")

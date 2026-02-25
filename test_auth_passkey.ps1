@@ -24,6 +24,71 @@ function Wait-Health {
     return $false
 }
 
+function Convert-ToBase64Url {
+    param([byte[]]$Bytes)
+    $b64 = [Convert]::ToBase64String($Bytes)
+    return $b64.TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
+
+function Get-AuthenticatorDataB64 {
+    param(
+        [string]$RpId,
+        [int]$SignCount
+    )
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $rpHash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($RpId))
+    } finally {
+        $sha.Dispose()
+    }
+    $bytes = New-Object byte[] 37
+    [Array]::Copy($rpHash, 0, $bytes, 0, 32)
+    $bytes[32] = 0x01
+    $bytes[33] = [byte](($SignCount -shr 24) -band 0xFF)
+    $bytes[34] = [byte](($SignCount -shr 16) -band 0xFF)
+    $bytes[35] = [byte](($SignCount -shr 8) -band 0xFF)
+    $bytes[36] = [byte]($SignCount -band 0xFF)
+    return Convert-ToBase64Url -Bytes $bytes
+}
+
+function Convert-FromBase64Url {
+    param([string]$Value)
+    $padded = $Value.Replace('-', '+').Replace('_', '/')
+    switch ($padded.Length % 4) {
+        2 { $padded += "==" }
+        3 { $padded += "=" }
+    }
+    return [Convert]::FromBase64String($padded)
+}
+
+function Get-SignatureB64 {
+    param(
+        [string]$CredentialKey,
+        [string]$AuthenticatorDataB64,
+        [string]$ClientDataJson
+    )
+    $authBytes = Convert-FromBase64Url -Value $AuthenticatorDataB64
+    $clientBytes = [System.Text.Encoding]::UTF8.GetBytes($ClientDataJson)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $clientHash = $sha.ComputeHash($clientBytes)
+    } finally {
+        $sha.Dispose()
+    }
+
+    $msg = New-Object byte[] ($authBytes.Length + $clientHash.Length)
+    [Array]::Copy($authBytes, 0, $msg, 0, $authBytes.Length)
+    [Array]::Copy($clientHash, 0, $msg, $authBytes.Length, $clientHash.Length)
+
+    $hmac = New-Object System.Security.Cryptography.HMACSHA256 (,([System.Text.Encoding]::UTF8.GetBytes($CredentialKey)))
+    try {
+        $sig = $hmac.ComputeHash($msg)
+    } finally {
+        $hmac.Dispose()
+    }
+    return Convert-ToBase64Url -Bytes $sig
+}
+
 $server = $null
 try {
     $childEnv = @{
@@ -51,6 +116,9 @@ try {
 
     $registerChallengeBody = @{ username = $username; flow = "register"; role = "moderator"; tenantId = $tenantId; rpId = $rpId; origin = $origin } | ConvertTo-Json -Compress
     $registerChallenge = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $Port + "/api/auth/passkey/challenge") -Method Post -ContentType "application/json" -Body $registerChallengeBody
+    $registerClientDataJson = (@{ type = "webauthn.create"; challenge = $registerChallenge.challenge; origin = $origin } | ConvertTo-Json -Compress)
+    $registerClientDataB64 = Convert-ToBase64Url -Bytes ([System.Text.Encoding]::UTF8.GetBytes($registerClientDataJson))
+    $registerAuthData = Get-AuthenticatorDataB64 -RpId $rpId -SignCount 1
 
     $registerBody = @{
         username = $username
@@ -62,6 +130,8 @@ try {
         rpId = $rpId
         origin = $origin
         clientDataType = "webauthn.create"
+        clientDataJSON = $registerClientDataB64
+        authenticatorData = $registerAuthData
     } | ConvertTo-Json -Compress
     $registered = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $Port + "/api/auth/passkey/register") -Method Post -ContentType "application/json" -Body $registerBody
     if ($registered.status -ne "registered") {
@@ -70,6 +140,10 @@ try {
 
     $loginChallengeBody = @{ username = $username; flow = "login"; tenantId = $tenantId; rpId = $rpId; origin = $origin } | ConvertTo-Json -Compress
     $loginChallenge = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $Port + "/api/auth/passkey/challenge") -Method Post -ContentType "application/json" -Body $loginChallengeBody
+    $loginClientDataJson = (@{ type = "webauthn.get"; challenge = $loginChallenge.challenge; origin = $origin } | ConvertTo-Json -Compress)
+    $loginClientDataB64 = Convert-ToBase64Url -Bytes ([System.Text.Encoding]::UTF8.GetBytes($loginClientDataJson))
+    $loginAuthData = Get-AuthenticatorDataB64 -RpId $rpId -SignCount 2
+    $signatureB64 = Get-SignatureB64 -CredentialKey $publicKey -AuthenticatorDataB64 $loginAuthData -ClientDataJson $loginClientDataJson
 
     $loginBody = @{
         username = $username
@@ -80,6 +154,9 @@ try {
         rpId = $rpId
         origin = $origin
         clientDataType = "webauthn.get"
+        clientDataJSON = $loginClientDataB64
+        authenticatorData = $loginAuthData
+        signature = $signatureB64
     } | ConvertTo-Json -Compress
     $login = Invoke-RestMethod -Uri ("http://127.0.0.1:" + $Port + "/api/auth/passkey/login") -Method Post -ContentType "application/json" -Body $loginBody
 

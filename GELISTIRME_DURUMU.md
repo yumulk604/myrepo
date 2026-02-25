@@ -39,8 +39,10 @@
 - [+] Realtime Core: Refresh/access revoke kaydi SQLite'a kalici yaziliyor (restart sonrasi da gecerli).
 - [+] Realtime Core: Passkey onboarding + JWT ile birlesik auth akisi (phase-1 minimal challenge/register/login).
 - [+] Realtime Core: Passkey strict metadata kontrolleri eklendi (rpId/origin/clientDataType + allowlist policy).
+- [+] Realtime Core: Passkey challenge bagli clientDataJSON ve authenticatorData (rpIdHash + UP flag + signCount) kontrolu eklendi.
+- [+] Realtime Core: Passkey login icin credential-bound HMAC signature verification eklendi (strict mode).
 - [+] Realtime Core: Passkey credential persistence eklendi (SQLite + disk fallback, restart sonrasi login devam).
-- [-] Realtime Core: Passkey WebAuthn imza/public-key kriptografik dogrulama (production hardening).
+- [-] Realtime Core: Passkey tam WebAuthn COSE public-key (ECDSA/EdDSA) signature verification (production hardening).
 
 - [-] Media Plane: 2-10 kisi icin P2P WebRTC akisi.
 - [-] Media Plane: 10+ icin SFU fallback (LiveKit veya mediasoup).
