@@ -216,6 +216,13 @@ std::unordered_map<std::string, std::deque<std::chrono::steady_clock::time_point
 std::mutex ws_rate_mutex;
 std::unordered_map<std::string, std::deque<std::chrono::steady_clock::time_point>> passkeyAttempts;
 std::mutex passkey_rate_mutex;
+struct PasskeyFailureState {
+    int failures = 0;
+    std::chrono::steady_clock::time_point lockUntil{};
+};
+std::unordered_map<std::string, std::deque<std::chrono::steady_clock::time_point>> passkeyFailureAttempts;
+std::mutex passkey_failure_mutex;
+std::mutex auth_audit_mutex;
 
 const std::string kDataDir = "data";
 const std::string kMessagesFile = "data/messages.jsonl";
@@ -223,6 +230,7 @@ const std::string kCallsFile = "data/calls.jsonl";
 const std::string kStreamsFile = "data/streams.jsonl";
 const std::string kRecordingsFile = "data/recordings.jsonl";
 const std::string kPasskeysFile = "data/passkeys.jsonl";
+const std::string kAuthAuditFile = "data/auth_audit.jsonl";
 const std::string kSqliteDbFile = "data/media.db";
 
 std::string detectStorageMode() {
@@ -2258,6 +2266,86 @@ bool consumePasskeyRateLimit(const std::string& clientIp, const std::string& use
     return true;
 }
 
+int passkeyLockoutThreshold() {
+    static const int threshold = getEnvIntWithFallback("GIGACHAD_PASSKEY_LOCKOUT_THRESHOLD", "MEDIA_PASSKEY_LOCKOUT_THRESHOLD", 5);
+    return threshold > 0 ? threshold : 5;
+}
+
+int passkeyLockoutDurationSec() {
+    static const int secs = getEnvIntWithFallback("GIGACHAD_PASSKEY_LOCKOUT_SEC", "MEDIA_PASSKEY_LOCKOUT_SEC", 120);
+    return secs > 0 ? secs : 120;
+}
+
+std::string passkeyFailureKey(const std::string& clientIpRaw, const std::string& usernameRaw) {
+    const std::string clientIp = trimWhitespace(clientIpRaw.empty() ? "unknown" : clientIpRaw);
+    const std::string username = toLower(trimWhitespace(usernameRaw));
+    return clientIp + "|" + (username.empty() ? "-" : username);
+}
+
+bool isPasskeyTemporarilyLocked(const std::string& key, int& retryAfterSecOut) {
+    retryAfterSecOut = 0;
+    const auto now = std::chrono::steady_clock::now();
+    const int threshold = passkeyLockoutThreshold();
+    const int durationSec = passkeyLockoutDurationSec();
+    std::lock_guard<std::mutex> lock(passkey_failure_mutex);
+    auto& attempts = passkeyFailureAttempts[key];
+    const auto cutoff = now - std::chrono::seconds(durationSec);
+    while (!attempts.empty() && attempts.front() < cutoff) {
+        attempts.pop_front();
+    }
+    if (static_cast<int>(attempts.size()) < threshold) {
+        return false;
+    }
+    const auto unlockAt = attempts.front() + std::chrono::seconds(durationSec);
+    const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(unlockAt - now).count();
+    retryAfterSecOut = remaining > 0 ? static_cast<int>(remaining) : 1;
+    return true;
+}
+
+void recordPasskeyFailure(const std::string& key) {
+    const auto now = std::chrono::steady_clock::now();
+    const int durationSec = passkeyLockoutDurationSec();
+    std::lock_guard<std::mutex> lock(passkey_failure_mutex);
+    auto& attempts = passkeyFailureAttempts[key];
+    const auto cutoff = now - std::chrono::seconds(durationSec);
+    while (!attempts.empty() && attempts.front() < cutoff) {
+        attempts.pop_front();
+    }
+    attempts.push_back(now);
+}
+
+void clearPasskeyFailures(const std::string& key) {
+    std::lock_guard<std::mutex> lock(passkey_failure_mutex);
+    passkeyFailureAttempts.erase(key);
+}
+
+void appendAuthAuditEvent(
+    const std::string& eventType,
+    const std::string& routePath,
+    const std::string& username,
+    const std::string& tenantId,
+    const std::string& clientIp,
+    const std::string& outcome,
+    const std::string& detail
+) {
+    std::lock_guard<std::mutex> lock(auth_audit_mutex);
+    std::ofstream out(kAuthAuditFile, std::ios::app);
+    if (!out.is_open()) {
+        return;
+    }
+    out
+        << "{"
+        << "\"timestamp\":\"" << escapeJSONString(getCurrentTimestamp()) << "\","
+        << "\"eventType\":\"" << escapeJSONString(eventType) << "\","
+        << "\"route\":\"" << escapeJSONString(routePath) << "\","
+        << "\"username\":\"" << escapeJSONString(username) << "\","
+        << "\"tenantId\":\"" << escapeJSONString(tenantId) << "\","
+        << "\"clientIp\":\"" << escapeJSONString(clientIp) << "\","
+        << "\"outcome\":\"" << escapeJSONString(outcome) << "\","
+        << "\"detail\":\"" << escapeJSONString(detail) << "\""
+        << "}\n";
+}
+
 std::vector<uint8_t> base64UrlDecodeToBytes(const std::string& in) {
     std::string decoded = base64UrlDecodeToString(in);
     if (decoded.empty() && !in.empty()) {
@@ -3233,14 +3321,34 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
         return res;
     }
 
-    if (routePath.find("/api/auth/passkey/") == 0) {
-        std::string username = trimWhitespace(extractJSONValue(req.body, "username"));
-        if (username.empty()) username = trimWhitespace(extractJSONValue(req.body, "user"));
-        if (!consumePasskeyRateLimit(resolveClientIpFromHeaders(req.headers), username)) {
-            res.status = 429;
-            res.statusText = "Too Many Requests";
-            res.body = "{\"error\":\"Passkey rate limit exceeded\"}";
-            return res;
+    const bool isPasskeyRoute = routePath.find("/api/auth/passkey/") == 0;
+    std::string passkeyUsername = trimWhitespace(extractJSONValue(req.body, "username"));
+    if (passkeyUsername.empty()) passkeyUsername = trimWhitespace(extractJSONValue(req.body, "user"));
+    std::string passkeyTenant = normalizeTenantId(extractJSONValue(req.body, "tenantId"));
+    const std::string passkeyClientIp = resolveClientIpFromHeaders(req.headers);
+    const std::string passkeyFailKey = passkeyFailureKey(passkeyClientIp, passkeyUsername);
+    auto passkeyFail = [&](int httpStatus, const std::string& statusText, const std::string& err, const std::string& detail) {
+        if (isPasskeyRoute && routePath == "/api/auth/passkey/login") {
+            recordPasskeyFailure(passkeyFailKey);
+            appendAuthAuditEvent("passkey.login", routePath, passkeyUsername, passkeyTenant, passkeyClientIp, "failure", detail);
+        }
+        res.status = httpStatus;
+        res.statusText = statusText;
+        res.body = "{\"error\":\"" + escapeJSONString(err) + "\"}";
+        return res;
+    };
+
+    if (isPasskeyRoute) {
+        if (!consumePasskeyRateLimit(passkeyClientIp, passkeyUsername)) {
+            return passkeyFail(429, "Too Many Requests", "Passkey rate limit exceeded", "rate_limit");
+        }
+        if (routePath == "/api/auth/passkey/login") {
+            int retryAfterSec = 0;
+            if (isPasskeyTemporarilyLocked(passkeyFailKey, retryAfterSec)) {
+                res.headers["Retry-After"] = std::to_string(retryAfterSec);
+                appendAuthAuditEvent("passkey.login", routePath, passkeyUsername, passkeyTenant, passkeyClientIp, "blocked", "lockout");
+                return passkeyFail(429, "Too Many Requests", "Passkey temporarily locked due to repeated failures", "lockout");
+            }
         }
     }
 
@@ -3296,6 +3404,7 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
                 expiresAt
             };
         }
+        appendAuthAuditEvent("passkey.challenge", routePath, username, tenantId, passkeyClientIp, "success", flow);
 
         res.body =
             "{"
@@ -3446,6 +3555,7 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
             persistPasskeyCredentialsToSqlite();
             persistPasskeyCredentialsToDisk();
         }
+        appendAuthAuditEvent("passkey.register", routePath, username, tenantId, passkeyClientIp, "success", "ok");
 
         res.body =
             "{"
@@ -3477,44 +3587,28 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
         const std::string signatureB64 = trimWhitespace(extractJSONValue(req.body, "signature"));
         int authDataSignCount = 0;
         std::string passkeyValidationError;
+        passkeyUsername = username;
+        passkeyTenant = normalizeTenantId(extractJSONValue(req.body, "tenantId"));
 
         if (challengeId.empty() || challenge.empty() || username.empty() || credentialId.empty()) {
-            res.status = 400;
-            res.statusText = "Bad Request";
-            res.body = "{\"error\":\"Missing required fields\"}";
-            return res;
+            return passkeyFail(400, "Bad Request", "Missing required fields", "missing_required");
         }
         if (passkeyStrictMetadataEnabled()) {
             if (reqRpId.empty() || reqOrigin.empty() || clientDataType.empty() ||
                 clientDataJsonB64.empty() || authenticatorDataB64.empty() || signatureB64.empty()) {
-                res.status = 400;
-                res.statusText = "Bad Request";
-                res.body = "{\"error\":\"Missing strict passkey metadata: rpId/origin/clientDataType/clientDataJSON/authenticatorData/signature\"}";
-                return res;
+                return passkeyFail(400, "Bad Request", "Missing strict passkey metadata: rpId/origin/clientDataType/clientDataJSON/authenticatorData/signature", "missing_strict_metadata");
             }
             if (clientDataType != "webauthn.get") {
-                res.status = 400;
-                res.statusText = "Bad Request";
-                res.body = "{\"error\":\"Invalid clientDataType for login\"}";
-                return res;
+                return passkeyFail(400, "Bad Request", "Invalid clientDataType for login", "invalid_client_data_type");
             }
             if (!isPasskeyOriginAllowed(reqOrigin)) {
-                res.status = 403;
-                res.statusText = "Forbidden";
-                res.body = "{\"error\":\"Origin is not allowed for passkey flow\"}";
-                return res;
+                return passkeyFail(403, "Forbidden", "Origin is not allowed for passkey flow", "origin_not_allowed");
             }
             if (!validatePasskeyClientData(clientDataJsonB64, "webauthn.get", challenge, reqOrigin, passkeyValidationError)) {
-                res.status = 401;
-                res.statusText = "Unauthorized";
-                res.body = "{\"error\":\"" + escapeJSONString(passkeyValidationError) + "\"}";
-                return res;
+                return passkeyFail(401, "Unauthorized", passkeyValidationError, "client_data_invalid");
             }
             if (!validatePasskeyAuthenticatorData(authenticatorDataB64, reqRpId, authDataSignCount, passkeyValidationError)) {
-                res.status = 401;
-                res.statusText = "Unauthorized";
-                res.body = "{\"error\":\"" + escapeJSONString(passkeyValidationError) + "\"}";
-                return res;
+                return passkeyFail(401, "Unauthorized", passkeyValidationError, "authenticator_data_invalid");
             }
             if (signCount < 0 || signCount < authDataSignCount) {
                 signCount = authDataSignCount;
@@ -3530,10 +3624,7 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
             cleanupExpiredPasskeyChallengesLocked(now);
             auto challengeIt = g_passkeyChallenges.find(challengeId);
             if (challengeIt == g_passkeyChallenges.end()) {
-                res.status = 401;
-                res.statusText = "Unauthorized";
-                res.body = "{\"error\":\"Invalid or expired challenge\"}";
-                return res;
+                return passkeyFail(401, "Unauthorized", "Invalid or expired challenge", "challenge_missing_or_expired");
             }
             const PasskeyChallengeState challengeState = challengeIt->second;
             if (challengeState.flow != "login" ||
@@ -3541,18 +3632,12 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
                 challengeState.username != username ||
                 challengeState.expiresAt <= now) {
                 g_passkeyChallenges.erase(challengeIt);
-                res.status = 401;
-                res.statusText = "Unauthorized";
-                res.body = "{\"error\":\"Challenge verification failed\"}";
-                return res;
+                return passkeyFail(401, "Unauthorized", "Challenge verification failed", "challenge_verify_failed");
             }
             if (passkeyStrictMetadataEnabled()) {
                 if (!challengeState.rpId.empty() && challengeState.rpId != reqRpId) {
                     g_passkeyChallenges.erase(challengeIt);
-                    res.status = 401;
-                    res.statusText = "Unauthorized";
-                    res.body = "{\"error\":\"rpId mismatch\"}";
-                    return res;
+                    return passkeyFail(401, "Unauthorized", "rpId mismatch", "rp_id_mismatch");
                 }
             }
             g_passkeyChallenges.erase(challengeIt);
@@ -3571,18 +3656,12 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
                                 clientDataJsonB64,
                                 signatureB64,
                                 passkeyValidationError)) {
-                            res.status = 401;
-                            res.statusText = "Unauthorized";
-                            res.body = "{\"error\":\"" + escapeJSONString(passkeyValidationError) + "\"}";
-                            return res;
+                            return passkeyFail(401, "Unauthorized", passkeyValidationError, "signature_invalid");
                         }
                         if (passkeyCounterStrictEnabled()) {
                             // Detect potential cloned authenticator or replay when counters are active.
                             if (authDataSignCount > 0 && credIt->signCount > 0 && authDataSignCount <= credIt->signCount) {
-                                res.status = 401;
-                                res.statusText = "Unauthorized";
-                                res.body = "{\"error\":\"Passkey signCount rollback/replay detected\"}";
-                                return res;
+                                return passkeyFail(401, "Unauthorized", "Passkey signCount rollback/replay detected", "counter_rollback");
                             }
                         }
                         signCount = authDataSignCount;
@@ -3606,14 +3685,13 @@ HTTPResponse handleAuthAPI(const HTTPRequest& req) {
         }
 
         if (!found) {
-            res.status = 401;
-            res.statusText = "Unauthorized";
-            res.body = "{\"error\":\"Passkey credential not found\"}";
-            return res;
+            return passkeyFail(401, "Unauthorized", "Passkey credential not found", "credential_not_found");
         }
 
         const std::string accessToken = buildJwtToken("access", username, selected.role, selected.tenantId, jwtAccessTtlSec());
         const std::string refreshToken = buildJwtToken("refresh", username, selected.role, selected.tenantId, jwtRefreshTtlSec());
+        clearPasskeyFailures(passkeyFailKey);
+        appendAuthAuditEvent("passkey.login", routePath, username, selected.tenantId, passkeyClientIp, "success", "ok");
         res.body =
             "{"
             "\"tokenType\":\"Bearer\","
@@ -4646,7 +4724,9 @@ HTTPResponse handleRequest(const HTTPRequest& req) {
       "Passkey RP/Origin env": "GIGACHAD_PASSKEY_RP_ID + GIGACHAD_PASSKEY_ALLOWED_ORIGINS (MEDIA_* aliases)",
       "Passkey strict metadata env": "GIGACHAD_PASSKEY_STRICT_METADATA or MEDIA_PASSKEY_STRICT_METADATA",
       "Passkey counter policy env": "GIGACHAD_PASSKEY_COUNTER_STRICT or MEDIA_PASSKEY_COUNTER_STRICT",
-      "Passkey rate-limit env": "GIGACHAD_PASSKEY_RATE_MAX_ATTEMPTS + GIGACHAD_PASSKEY_RATE_WINDOW_SEC (MEDIA_* aliases)"
+      "Passkey rate-limit env": "GIGACHAD_PASSKEY_RATE_MAX_ATTEMPTS + GIGACHAD_PASSKEY_RATE_WINDOW_SEC (MEDIA_* aliases)",
+      "Passkey lockout env": "GIGACHAD_PASSKEY_LOCKOUT_THRESHOLD + GIGACHAD_PASSKEY_LOCKOUT_SEC (MEDIA_* aliases)",
+      "Auth audit log": "data/auth_audit.jsonl"
     },
     "Realtime": {
       "GET /ws?room={roomId}&user={userId}&tenant={tenantId}&token={token}": "WebSocket event stream"

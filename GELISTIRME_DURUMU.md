@@ -43,6 +43,8 @@
 - [+] Realtime Core: Passkey login icin credential-bound HMAC signature verification eklendi (strict mode).
 - [+] Realtime Core: Passkey counter rollback/replay korumasi eklendi (GIGACHAD_PASSKEY_COUNTER_STRICT).
 - [+] Realtime Core: Passkey endpoint rate-limit eklendi (IP+username, 429, env ile ayarlanabilir).
+- [+] Realtime Core: Passkey lockout/backoff eklendi (tekrarli login hatalarinda gecici kilit + Retry-After).
+- [+] Realtime Core: Auth audit log eklendi (data/auth_audit.jsonl).
 - [+] Realtime Core: Passkey credential persistence eklendi (SQLite + disk fallback, restart sonrasi login devam).
 - [-] Realtime Core: Passkey tam WebAuthn COSE public-key (ECDSA/EdDSA) signature verification (production hardening).
 
@@ -87,6 +89,8 @@
 - [+] Passkey negatif testleri genisletildi (bad signature + signCount rollback bloklama).
 - [+] test_auth_passkey_rate_limit.ps1 eklendi ve PASS alindi (20 istek icinde 429).
 - [+] CI pipeline'a passkey rate-limit test adimi eklendi.
+- [+] test_auth_passkey_lockout.ps1 eklendi ve PASS alindi (tekrarli bad-signature denemelerinde lockout 429).
+- [+] CI pipeline'a passkey lockout test adimi eklendi.
 
 
 
