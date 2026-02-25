@@ -50,8 +50,9 @@
 - [+] Realtime Core: Passkey signature mode konfigurasyonu eklendi (`GIGACHAD_PASSKEY_SIGNATURE_MODE` / `MEDIA_PASSKEY_SIGNATURE_MODE`, `hmac|es256`).
 - [+] Realtime Core: Passkey imza dogrulama katmani modulerlestirildi (dispatcher: HMAC aktif, ES256 scaffold kontrollu hata mesaji ile hazir).
 - [+] Realtime Core: Passkey ES256 COSE public-key signature verification eklendi (COSE key parse + ECDSA P-256 verify, Windows/CNG `bcrypt`).
+- [+] Realtime Core: Passkey EdDSA COSE signature verification backend eklendi (libsodium dynamic load: `libsodium.dll`/`sodium.dll`).
 - [-] Realtime Core: Passkey tam WebAuthn COSE public-key (ECDSA/EdDSA) signature verification (production hardening).
-- [-] Realtime Core: Passkey EdDSA (alg=-8 / Ed25519) COSE signature verification (runtime crypto backend ile).
+- [-] Realtime Core: Passkey EdDSA (alg=-8 / Ed25519) production rollout dogrulamasi (bu makinede libsodium runtime mevcut degil, canli entegrasyon testi beklemede).
 
 - [-] Media Plane: 2-10 kisi icin P2P WebRTC akisi.
 - [-] Media Plane: 10+ icin SFU fallback (LiveKit veya mediasoup).

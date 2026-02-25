@@ -16,6 +16,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
+#include <dlfcn.h>
 #endif
 
 #include <iostream>
@@ -2796,8 +2797,92 @@ bool verifyPasskeyCoseSignature(
 #endif
     }
     if (coseKey.alg == -8) {
-        errorReason = "EdDSA COSE verification is not enabled in this build";
-        return false;
+        struct SodiumBackendState {
+            bool attempted = false;
+            bool ready = false;
+#ifdef _WIN32
+            HMODULE module = nullptr;
+#else
+            void* module = nullptr;
+#endif
+            int (*sodium_init_fn)(void) = nullptr;
+            int (*verify_detached_fn)(const unsigned char*, const unsigned char*, unsigned long long, const unsigned char*) = nullptr;
+        };
+
+        static SodiumBackendState backend;
+        static std::mutex backendMutex;
+        auto ensureSodiumReady = [&](std::string& outErr) -> bool {
+            std::lock_guard<std::mutex> lock(backendMutex);
+            if (backend.ready) return true;
+            if (backend.attempted) {
+                outErr = "EdDSA verification backend unavailable (libsodium not loaded)";
+                return false;
+            }
+            backend.attempted = true;
+
+#ifdef _WIN32
+            const char* candidates[] = { "libsodium.dll", "sodium.dll" };
+            for (const char* name : candidates) {
+                backend.module = LoadLibraryA(name);
+                if (backend.module != nullptr) break;
+            }
+            if (backend.module == nullptr) {
+                outErr = "EdDSA verification backend unavailable (libsodium dll missing)";
+                return false;
+            }
+            backend.sodium_init_fn = reinterpret_cast<int (*)(void)>(GetProcAddress(backend.module, "sodium_init"));
+            backend.verify_detached_fn = reinterpret_cast<int (*)(const unsigned char*, const unsigned char*, unsigned long long, const unsigned char*)>(
+                GetProcAddress(backend.module, "crypto_sign_verify_detached")
+            );
+#else
+            const char* candidates[] = { "libsodium.so.23", "libsodium.so" };
+            for (const char* name : candidates) {
+                backend.module = dlopen(name, RTLD_NOW);
+                if (backend.module != nullptr) break;
+            }
+            if (backend.module == nullptr) {
+                outErr = "EdDSA verification backend unavailable (libsodium shared object missing)";
+                return false;
+            }
+            backend.sodium_init_fn = reinterpret_cast<int (*)(void)>(dlsym(backend.module, "sodium_init"));
+            backend.verify_detached_fn = reinterpret_cast<int (*)(const unsigned char*, const unsigned char*, unsigned long long, const unsigned char*)>(
+                dlsym(backend.module, "crypto_sign_verify_detached")
+            );
+#endif
+            if (backend.sodium_init_fn == nullptr || backend.verify_detached_fn == nullptr) {
+                outErr = "EdDSA verification backend unavailable (libsodium symbols missing)";
+                return false;
+            }
+            if (backend.sodium_init_fn() < 0) {
+                outErr = "EdDSA verification backend init failed";
+                return false;
+            }
+            backend.ready = true;
+            return true;
+        };
+
+        if (coseKey.kty != 1 || coseKey.crv != 6 || coseKey.x.size() != 32) {
+            errorReason = "Invalid EdDSA COSE key parameters";
+            return false;
+        }
+        if (signature.size() != 64) {
+            errorReason = "EdDSA signature must be 64 bytes";
+            return false;
+        }
+        if (!ensureSodiumReady(errorReason)) {
+            return false;
+        }
+        const int rc = backend.verify_detached_fn(
+            reinterpret_cast<const unsigned char*>(signature.data()),
+            reinterpret_cast<const unsigned char*>(signingData.data()),
+            static_cast<unsigned long long>(signingData.size()),
+            reinterpret_cast<const unsigned char*>(coseKey.x.data())
+        );
+        if (rc != 0) {
+            errorReason = "EdDSA signature verification failed";
+            return false;
+        }
+        return true;
     }
     errorReason = "Unsupported COSE algorithm";
     return false;
@@ -5238,6 +5323,7 @@ HTTPResponse handleRequest(const HTTPRequest& req) {
       "Passkey strict metadata env": "GIGACHAD_PASSKEY_STRICT_METADATA or MEDIA_PASSKEY_STRICT_METADATA",
       "Passkey counter policy env": "GIGACHAD_PASSKEY_COUNTER_STRICT or MEDIA_PASSKEY_COUNTER_STRICT",
       "Passkey signature mode env": "GIGACHAD_PASSKEY_SIGNATURE_MODE (hmac|es256) or MEDIA_PASSKEY_SIGNATURE_MODE",
+      "Passkey EdDSA backend": "EdDSA verification requires libsodium runtime (libsodium.dll/sodium.dll)",
       "Passkey rate-limit env": "GIGACHAD_PASSKEY_RATE_MAX_ATTEMPTS + GIGACHAD_PASSKEY_RATE_WINDOW_SEC (MEDIA_* aliases)",
       "Passkey lockout env": "GIGACHAD_PASSKEY_LOCKOUT_THRESHOLD + GIGACHAD_PASSKEY_LOCKOUT_SEC (MEDIA_* aliases)",
       "Auth audit log": "data/auth_audit.jsonl"
