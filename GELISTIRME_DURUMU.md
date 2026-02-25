@@ -49,7 +49,9 @@
 - [+] Realtime Core: Passkey credential persistence eklendi (SQLite + disk fallback, restart sonrasi login devam).
 - [+] Realtime Core: Passkey signature mode konfigurasyonu eklendi (`GIGACHAD_PASSKEY_SIGNATURE_MODE` / `MEDIA_PASSKEY_SIGNATURE_MODE`, `hmac|es256`).
 - [+] Realtime Core: Passkey imza dogrulama katmani modulerlestirildi (dispatcher: HMAC aktif, ES256 scaffold kontrollu hata mesaji ile hazir).
+- [+] Realtime Core: Passkey ES256 COSE public-key signature verification eklendi (COSE key parse + ECDSA P-256 verify, Windows/CNG `bcrypt`).
 - [-] Realtime Core: Passkey tam WebAuthn COSE public-key (ECDSA/EdDSA) signature verification (production hardening).
+- [-] Realtime Core: Passkey EdDSA (alg=-8 / Ed25519) COSE signature verification (runtime crypto backend ile).
 
 - [-] Media Plane: 2-10 kisi icin P2P WebRTC akisi.
 - [-] Media Plane: 10+ icin SFU fallback (LiveKit veya mediasoup).
@@ -100,6 +102,7 @@
 - [+] Passkey signature mode env dokumantasyonu /api dokuman cikisina eklendi.
 - [+] PowerShell test altyapisi guncellendi: `Start-Process -Environment` yerine PS5.1 uyumlu `Start-ProcessWithEnvironment` helper kullanimi.
 - [+] Auth/Passkey/WS test scriptleri yerel ortamda yeniden calistirildi (port cakismasini azaltmak icin ozellestirilmis portlarla PASS dogrulamasi).
+- [+] test_auth_passkey_es256.ps1 eklendi ve PASS alindi (ES256 COSE register/login + invalid signature bloklama).
 
 
 

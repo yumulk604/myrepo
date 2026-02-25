@@ -14,7 +14,7 @@ if ($gpp) {
     Write-Host "✓ Found g++ at: $($gpp.Source)" -ForegroundColor Green
     Write-Host "`nCompiling Media Server..." -ForegroundColor Yellow
     
-    g++ -std=c++17 media_server.cpp -o media_server.exe -lws2_32 -O2 -static
+    g++ -std=c++17 media_server.cpp -o media_server.exe -lws2_32 -lbcrypt -O2 -static
     
     if ($LASTEXITCODE -eq 0) {
         Write-Host "✓ Build successful!" -ForegroundColor Green
@@ -36,7 +36,7 @@ if ($cl) {
     Write-Host "✓ Found MSVC cl at: $($cl.Source)" -ForegroundColor Green
     Write-Host "`nCompiling Media Server..." -ForegroundColor Yellow
     
-    cl /EHsc /std:c++17 /O2 media_server.cpp /Fe:media_server.exe ws2_32.lib
+    cl /EHsc /std:c++17 /O2 media_server.cpp /Fe:media_server.exe ws2_32.lib bcrypt.lib
     
     if ($LASTEXITCODE -eq 0) {
         Write-Host "✓ Build successful!" -ForegroundColor Green
@@ -58,6 +58,5 @@ Write-Host "`nPlease install one of the following:" -ForegroundColor Yellow
 Write-Host "  1. MinGW-w64: https://www.mingw-w64.org/" -ForegroundColor White
 Write-Host "  2. TDM-GCC: https://jmeubank.github.io/tdm-gcc/" -ForegroundColor White
 exit 1
-
 
 

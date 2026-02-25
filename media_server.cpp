@@ -1,13 +1,15 @@
 // Complete Media Server with MongoDB Integration
 // Supports: Chat, Voice Calls, Video Calls, Live Streaming
-// Compile: g++ -std=c++17 media_server.cpp -o media_server.exe -lws2_32 -O2 -static
+// Compile: g++ -std=c++17 media_server.cpp -o media_server.exe -lws2_32 -lbcrypt -O2 -static
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <bcrypt.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "bcrypt.lib")
 #else
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -2193,6 +2195,8 @@ bool passkeyCounterStrictEnabled() {
     return strictValue != 0;
 }
 
+bool validatePasskeyCoseCredentialMaterial(const std::string& credentialKeyMaterial, std::string& errorReason);
+
 std::string passkeySignatureMode() {
     static const std::string mode = []() {
         std::string raw = toLower(trimWhitespace(getEnvStringWithFallback(
@@ -2214,12 +2218,7 @@ bool validatePasskeyCredentialMaterial(const std::string& credentialKeyMaterial,
     if (passkeySignatureMode() == "hmac") {
         return true;
     }
-    const std::string decoded = base64UrlDecodeToString(credentialKeyMaterial);
-    if (decoded.size() < 32) {
-        errorReason = "ES256 publicKey must be base64url and at least 32 bytes";
-        return false;
-    }
-    return true;
+    return validatePasskeyCoseCredentialMaterial(credentialKeyMaterial, errorReason);
 }
 
 std::string passkeyRpId() {
@@ -2404,6 +2403,406 @@ bool constantTimeEqual(const std::vector<uint8_t>& a, const std::vector<uint8_t>
     return diff == 0;
 }
 
+struct ParsedCosePublicKey {
+    int kty = 0;
+    int alg = 0;
+    bool hasAlg = false;
+    int crv = 0;
+    std::vector<uint8_t> x;
+    std::vector<uint8_t> y;
+};
+
+bool readCborLength(const std::vector<uint8_t>& in, size_t& offset, uint8_t ai, uint64_t& outLen) {
+    if (ai <= 23) {
+        outLen = ai;
+        return true;
+    }
+    if (ai == 24) {
+        if (offset + 1 > in.size()) return false;
+        outLen = in[offset++];
+        return true;
+    }
+    if (ai == 25) {
+        if (offset + 2 > in.size()) return false;
+        outLen = (static_cast<uint64_t>(in[offset]) << 8) | static_cast<uint64_t>(in[offset + 1]);
+        offset += 2;
+        return true;
+    }
+    if (ai == 26) {
+        if (offset + 4 > in.size()) return false;
+        outLen = (static_cast<uint64_t>(in[offset]) << 24) |
+                 (static_cast<uint64_t>(in[offset + 1]) << 16) |
+                 (static_cast<uint64_t>(in[offset + 2]) << 8) |
+                 static_cast<uint64_t>(in[offset + 3]);
+        offset += 4;
+        return true;
+    }
+    if (ai == 27) {
+        if (offset + 8 > in.size()) return false;
+        outLen = 0;
+        for (int i = 0; i < 8; ++i) {
+            outLen = (outLen << 8) | static_cast<uint64_t>(in[offset + i]);
+        }
+        offset += 8;
+        return true;
+    }
+    return false;
+}
+
+bool readCborSignedInt(const std::vector<uint8_t>& in, size_t& offset, int64_t& outValue) {
+    if (offset >= in.size()) return false;
+    const uint8_t initial = in[offset++];
+    const uint8_t major = static_cast<uint8_t>(initial >> 5);
+    const uint8_t ai = static_cast<uint8_t>(initial & 0x1F);
+    if (major != 0 && major != 1) return false;
+    uint64_t val = 0;
+    if (!readCborLength(in, offset, ai, val)) return false;
+    if (major == 0) {
+        if (val > static_cast<uint64_t>(INT64_MAX)) return false;
+        outValue = static_cast<int64_t>(val);
+        return true;
+    }
+    if (val > static_cast<uint64_t>(INT64_MAX)) return false;
+    outValue = -1 - static_cast<int64_t>(val);
+    return true;
+}
+
+bool readCborByteString(const std::vector<uint8_t>& in, size_t& offset, std::vector<uint8_t>& outBytes) {
+    if (offset >= in.size()) return false;
+    const uint8_t initial = in[offset++];
+    const uint8_t major = static_cast<uint8_t>(initial >> 5);
+    const uint8_t ai = static_cast<uint8_t>(initial & 0x1F);
+    if (major != 2) return false;
+    uint64_t len = 0;
+    if (!readCborLength(in, offset, ai, len)) return false;
+    if (offset + len > in.size()) return false;
+    outBytes.assign(in.begin() + static_cast<std::ptrdiff_t>(offset), in.begin() + static_cast<std::ptrdiff_t>(offset + len));
+    offset += static_cast<size_t>(len);
+    return true;
+}
+
+bool skipCborItem(const std::vector<uint8_t>& in, size_t& offset) {
+    if (offset >= in.size()) return false;
+    const uint8_t initial = in[offset++];
+    const uint8_t major = static_cast<uint8_t>(initial >> 5);
+    const uint8_t ai = static_cast<uint8_t>(initial & 0x1F);
+
+    uint64_t len = 0;
+    switch (major) {
+        case 0:
+        case 1:
+            return readCborLength(in, offset, ai, len);
+        case 2:
+        case 3:
+            if (!readCborLength(in, offset, ai, len)) return false;
+            if (offset + len > in.size()) return false;
+            offset += static_cast<size_t>(len);
+            return true;
+        case 4:
+            if (!readCborLength(in, offset, ai, len)) return false;
+            for (uint64_t i = 0; i < len; ++i) {
+                if (!skipCborItem(in, offset)) return false;
+            }
+            return true;
+        case 5:
+            if (!readCborLength(in, offset, ai, len)) return false;
+            for (uint64_t i = 0; i < len; ++i) {
+                if (!skipCborItem(in, offset)) return false;
+                if (!skipCborItem(in, offset)) return false;
+            }
+            return true;
+        case 6:
+            if (!readCborLength(in, offset, ai, len)) return false;
+            return skipCborItem(in, offset);
+        case 7:
+            if (ai <= 23) return true;
+            if (ai == 24) return offset + 1 <= in.size() ? (++offset, true) : false;
+            if (ai == 25) return offset + 2 <= in.size() ? (offset += 2, true) : false;
+            if (ai == 26) return offset + 4 <= in.size() ? (offset += 4, true) : false;
+            if (ai == 27) return offset + 8 <= in.size() ? (offset += 8, true) : false;
+            return false;
+        default:
+            return false;
+    }
+}
+
+bool parseCosePublicKey(const std::vector<uint8_t>& cbor, ParsedCosePublicKey& outKey, std::string& errorReason) {
+    size_t offset = 0;
+    if (offset >= cbor.size()) {
+        errorReason = "COSE publicKey is empty";
+        return false;
+    }
+
+    const uint8_t initial = cbor[offset++];
+    const uint8_t major = static_cast<uint8_t>(initial >> 5);
+    const uint8_t ai = static_cast<uint8_t>(initial & 0x1F);
+    if (major != 5) {
+        errorReason = "COSE publicKey must be CBOR map";
+        return false;
+    }
+
+    uint64_t mapLen = 0;
+    if (!readCborLength(cbor, offset, ai, mapLen)) {
+        errorReason = "Invalid COSE map length";
+        return false;
+    }
+
+    for (uint64_t i = 0; i < mapLen; ++i) {
+        int64_t key = 0;
+        if (!readCborSignedInt(cbor, offset, key)) {
+            errorReason = "Invalid COSE map key";
+            return false;
+        }
+        if (key == 1 || key == 3 || key == -1) {
+            int64_t val = 0;
+            if (!readCborSignedInt(cbor, offset, val)) {
+                errorReason = "Invalid COSE integer parameter";
+                return false;
+            }
+            if (key == 1) outKey.kty = static_cast<int>(val);
+            if (key == 3) {
+                outKey.alg = static_cast<int>(val);
+                outKey.hasAlg = true;
+            }
+            if (key == -1) outKey.crv = static_cast<int>(val);
+            continue;
+        }
+        if (key == -2 || key == -3) {
+            std::vector<uint8_t> bytes;
+            if (!readCborByteString(cbor, offset, bytes)) {
+                errorReason = "Invalid COSE byte-string parameter";
+                return false;
+            }
+            if (key == -2) outKey.x = std::move(bytes);
+            else outKey.y = std::move(bytes);
+            continue;
+        }
+        if (!skipCborItem(cbor, offset)) {
+            errorReason = "Invalid COSE extra parameter";
+            return false;
+        }
+    }
+
+    if (offset != cbor.size()) {
+        errorReason = "Trailing bytes in COSE publicKey";
+        return false;
+    }
+    return true;
+}
+
+bool validatePasskeyCoseCredentialMaterial(const std::string& credentialKeyMaterial, std::string& errorReason) {
+    const std::vector<uint8_t> coseBytes = base64UrlDecodeToBytes(credentialKeyMaterial);
+    if (coseBytes.empty()) {
+        errorReason = "COSE publicKey must be base64url encoded";
+        return false;
+    }
+    ParsedCosePublicKey coseKey;
+    if (!parseCosePublicKey(coseBytes, coseKey, errorReason)) {
+        return false;
+    }
+    if (!coseKey.hasAlg) {
+        errorReason = "COSE publicKey missing alg field";
+        return false;
+    }
+    if (coseKey.alg != -7 && coseKey.alg != -8) {
+        errorReason = "COSE alg must be ES256(-7) or EdDSA(-8)";
+        return false;
+    }
+    if (coseKey.alg == -7) {
+        if (coseKey.kty != 2 || coseKey.crv != 1 || coseKey.x.size() != 32 || coseKey.y.size() != 32) {
+            errorReason = "Invalid ES256 COSE key parameters";
+            return false;
+        }
+    } else if (coseKey.alg == -8) {
+        if (coseKey.kty != 1 || coseKey.crv != 6 || coseKey.x.size() != 32) {
+            errorReason = "Invalid EdDSA COSE key parameters";
+            return false;
+        }
+    }
+    return true;
+}
+
+bool parseDerLength(const std::vector<uint8_t>& der, size_t& offset, size_t& outLen) {
+    if (offset >= der.size()) return false;
+    const uint8_t first = der[offset++];
+    if ((first & 0x80) == 0) {
+        outLen = first;
+        return true;
+    }
+    const size_t numBytes = static_cast<size_t>(first & 0x7F);
+    if (numBytes == 0 || numBytes > sizeof(size_t) || offset + numBytes > der.size()) {
+        return false;
+    }
+    size_t value = 0;
+    for (size_t i = 0; i < numBytes; ++i) {
+        value = (value << 8) | static_cast<size_t>(der[offset + i]);
+    }
+    offset += numBytes;
+    outLen = value;
+    return true;
+}
+
+bool normalizeDerIntegerToFixedWidth(const uint8_t* data, size_t len, size_t fixedLen, std::vector<uint8_t>& out, std::string& errorReason) {
+    while (len > 0 && *data == 0x00) {
+        ++data;
+        --len;
+    }
+    if (len > fixedLen) {
+        errorReason = "DER integer too large";
+        return false;
+    }
+    out.assign(fixedLen, 0);
+    if (len > 0) {
+        std::memcpy(out.data() + (fixedLen - len), data, len);
+    }
+    return true;
+}
+
+bool parseEcdsaDerSignatureToRawRs(
+    const std::vector<uint8_t>& derSig,
+    size_t componentLen,
+    std::vector<uint8_t>& rawSigOut,
+    std::string& errorReason
+) {
+    if (derSig.size() == componentLen * 2) {
+        rawSigOut = derSig;
+        return true;
+    }
+    if (derSig.size() < 8 || derSig[0] != 0x30) {
+        errorReason = "ECDSA signature must be DER sequence";
+        return false;
+    }
+
+    size_t offset = 1;
+    size_t seqLen = 0;
+    if (!parseDerLength(derSig, offset, seqLen) || offset + seqLen != derSig.size()) {
+        errorReason = "Invalid ECDSA DER sequence length";
+        return false;
+    }
+    if (offset >= derSig.size() || derSig[offset++] != 0x02) {
+        errorReason = "ECDSA DER missing R integer";
+        return false;
+    }
+    size_t rLen = 0;
+    if (!parseDerLength(derSig, offset, rLen) || offset + rLen > derSig.size()) {
+        errorReason = "Invalid ECDSA DER R length";
+        return false;
+    }
+    const uint8_t* rPtr = derSig.data() + offset;
+    offset += rLen;
+
+    if (offset >= derSig.size() || derSig[offset++] != 0x02) {
+        errorReason = "ECDSA DER missing S integer";
+        return false;
+    }
+    size_t sLen = 0;
+    if (!parseDerLength(derSig, offset, sLen) || offset + sLen != derSig.size()) {
+        errorReason = "Invalid ECDSA DER S length";
+        return false;
+    }
+    const uint8_t* sPtr = derSig.data() + offset;
+
+    std::vector<uint8_t> rNorm;
+    std::vector<uint8_t> sNorm;
+    if (!normalizeDerIntegerToFixedWidth(rPtr, rLen, componentLen, rNorm, errorReason)) return false;
+    if (!normalizeDerIntegerToFixedWidth(sPtr, sLen, componentLen, sNorm, errorReason)) return false;
+
+    rawSigOut.reserve(componentLen * 2);
+    rawSigOut.insert(rawSigOut.end(), rNorm.begin(), rNorm.end());
+    rawSigOut.insert(rawSigOut.end(), sNorm.begin(), sNorm.end());
+    return true;
+}
+
+#ifdef _WIN32
+bool verifyEs256SignatureWindows(
+    const ParsedCosePublicKey& coseKey,
+    const std::vector<uint8_t>& signingData,
+    const std::vector<uint8_t>& derSignature,
+    std::string& errorReason
+) {
+    if (coseKey.x.size() != 32 || coseKey.y.size() != 32) {
+        errorReason = "ES256 key must contain 32-byte x and y coordinates";
+        return false;
+    }
+
+    std::vector<uint8_t> rawSig;
+    if (!parseEcdsaDerSignatureToRawRs(derSignature, 32, rawSig, errorReason)) {
+        return false;
+    }
+
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_KEY_HANDLE key = nullptr;
+    std::vector<uint8_t> blob(sizeof(BCRYPT_ECCKEY_BLOB) + 64, 0);
+    auto* header = reinterpret_cast<BCRYPT_ECCKEY_BLOB*>(blob.data());
+    header->dwMagic = BCRYPT_ECDSA_PUBLIC_P256_MAGIC;
+    header->cbKey = 32;
+    std::memcpy(blob.data() + sizeof(BCRYPT_ECCKEY_BLOB), coseKey.x.data(), 32);
+    std::memcpy(blob.data() + sizeof(BCRYPT_ECCKEY_BLOB) + 32, coseKey.y.data(), 32);
+
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&alg, BCRYPT_ECDSA_P256_ALGORITHM, nullptr, 0);
+    if (status < 0 || alg == nullptr) {
+        errorReason = "Failed to open ES256 crypto provider";
+        return false;
+    }
+    status = BCryptImportKeyPair(
+        alg,
+        nullptr,
+        BCRYPT_ECCPUBLIC_BLOB,
+        &key,
+        blob.data(),
+        static_cast<ULONG>(blob.size()),
+        0
+    );
+    if (status < 0 || key == nullptr) {
+        BCryptCloseAlgorithmProvider(alg, 0);
+        errorReason = "Failed to import ES256 COSE public key";
+        return false;
+    }
+
+    const std::string signingInput(reinterpret_cast<const char*>(signingData.data()), signingData.size());
+    const auto digest = sha256(signingInput);
+    status = BCryptVerifySignature(
+        key,
+        nullptr,
+        const_cast<PUCHAR>(reinterpret_cast<const UCHAR*>(digest.data())),
+        static_cast<ULONG>(digest.size()),
+        const_cast<PUCHAR>(reinterpret_cast<const UCHAR*>(rawSig.data())),
+        static_cast<ULONG>(rawSig.size()),
+        0
+    );
+
+    BCryptDestroyKey(key);
+    BCryptCloseAlgorithmProvider(alg, 0);
+    if (status < 0) {
+        errorReason = "ES256 signature verification failed";
+        return false;
+    }
+    return true;
+}
+#endif
+
+bool verifyPasskeyCoseSignature(
+    const ParsedCosePublicKey& coseKey,
+    const std::vector<uint8_t>& signingData,
+    const std::vector<uint8_t>& signature,
+    std::string& errorReason
+) {
+    if (coseKey.alg == -7) {
+#ifdef _WIN32
+        return verifyEs256SignatureWindows(coseKey, signingData, signature, errorReason);
+#else
+        errorReason = "ES256 verification is only enabled on Windows in this build";
+        return false;
+#endif
+    }
+    if (coseKey.alg == -8) {
+        errorReason = "EdDSA COSE verification is not enabled in this build";
+        return false;
+    }
+    errorReason = "Unsupported COSE algorithm";
+    return false;
+}
+
 bool validatePasskeyClientData(
     const std::string& clientDataJsonB64,
     const std::string& expectedType,
@@ -2522,20 +2921,36 @@ bool validatePasskeySignatureEs256(
     if (!validatePasskeyCredentialMaterial(credentialPublicKey, errorReason)) {
         return false;
     }
-    if (base64UrlDecodeToBytes(authenticatorDataB64).empty()) {
+
+    const std::vector<uint8_t> authData = base64UrlDecodeToBytes(authenticatorDataB64);
+    if (authData.empty()) {
         errorReason = "Invalid authenticatorData for signature validation";
         return false;
     }
-    if (decodePossiblyBase64UrlJson(clientDataJsonB64).empty()) {
+    const std::string clientDataJson = decodePossiblyBase64UrlJson(clientDataJsonB64);
+    if (clientDataJson.empty()) {
         errorReason = "Invalid clientDataJSON for signature validation";
         return false;
     }
-    if (base64UrlDecodeToBytes(signatureB64).empty()) {
+    const std::vector<uint8_t> providedSig = base64UrlDecodeToBytes(signatureB64);
+    if (providedSig.empty()) {
         errorReason = "Invalid signature encoding";
         return false;
     }
-    errorReason = "ES256 passkey signature verification is not enabled in this build";
-    return false;
+
+    const std::vector<uint8_t> coseBytes = base64UrlDecodeToBytes(credentialPublicKey);
+    ParsedCosePublicKey coseKey;
+    if (!parseCosePublicKey(coseBytes, coseKey, errorReason)) {
+        return false;
+    }
+
+    const auto clientDataHash = sha256(clientDataJson);
+    std::vector<uint8_t> signingMessage;
+    signingMessage.reserve(authData.size() + clientDataHash.size());
+    signingMessage.insert(signingMessage.end(), authData.begin(), authData.end());
+    signingMessage.insert(signingMessage.end(), clientDataHash.begin(), clientDataHash.end());
+
+    return verifyPasskeyCoseSignature(coseKey, signingMessage, providedSig, errorReason);
 }
 
 bool validatePasskeySignature(
