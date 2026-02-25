@@ -51,8 +51,8 @@
 - [+] Realtime Core: Passkey imza dogrulama katmani modulerlestirildi (dispatcher: HMAC aktif, ES256 scaffold kontrollu hata mesaji ile hazir).
 - [+] Realtime Core: Passkey ES256 COSE public-key signature verification eklendi (COSE key parse + ECDSA P-256 verify, Windows/CNG `bcrypt`).
 - [+] Realtime Core: Passkey EdDSA COSE signature verification backend eklendi (libsodium dynamic load: `libsodium.dll`/`sodium.dll`).
-- [-] Realtime Core: Passkey tam WebAuthn COSE public-key (ECDSA/EdDSA) signature verification (production hardening).
-- [-] Realtime Core: Passkey EdDSA (alg=-8 / Ed25519) production rollout dogrulamasi (bu makinede libsodium runtime mevcut degil, canli entegrasyon testi beklemede).
+- [+] Realtime Core: Passkey tam WebAuthn COSE public-key (ECDSA/EdDSA) signature verification (production hardening).
+- [+] Realtime Core: Passkey EdDSA (alg=-8 / Ed25519) production rollout localde dogrulandi (Windows + libsodium.dll ile canli entegrasyon testi PASS).
 
 - [-] Media Plane: 2-10 kisi icin P2P WebRTC akisi.
 - [-] Media Plane: 10+ icin SFU fallback (LiveKit veya mediasoup).
@@ -104,6 +104,8 @@
 - [+] PowerShell test altyapisi guncellendi: `Start-Process -Environment` yerine PS5.1 uyumlu `Start-ProcessWithEnvironment` helper kullanimi.
 - [+] Auth/Passkey/WS test scriptleri yerel ortamda yeniden calistirildi (port cakismasini azaltmak icin ozellestirilmis portlarla PASS dogrulamasi).
 - [+] test_auth_passkey_es256.ps1 eklendi ve PASS alindi (ES256 COSE register/login + invalid signature bloklama).
+- [+] setup_libsodium_windows.ps1 eklendi (Windows icin libsodium.dll hizli kurulum scripti).
+- [+] test_auth_passkey_eddsa.ps1 eklendi ve PASS alindi (Ed25519 COSE register/login + invalid signature bloklama).
 
 
 
