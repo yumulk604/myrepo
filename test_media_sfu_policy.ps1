@@ -1,5 +1,5 @@
 param(
-    [int]$Port = 18841,
+    [int]$Port = 18861,
     [int]$TimeoutSec = 20
 )
 
@@ -99,50 +99,55 @@ try {
         MEDIA_WS_TOKEN = ""
         GIGACHAD_MEDIA_P2P_MAX_PEERS = "2"
         MEDIA_P2P_MAX_PEERS = "2"
+        GIGACHAD_SFU_ENABLED = "1"
+        MEDIA_SFU_ENABLED = "1"
+        GIGACHAD_SFU_PROVIDER = "livekit"
+        MEDIA_SFU_PROVIDER = "livekit"
+        GIGACHAD_SFU_BASE_URL = "wss://sfu.local"
+        MEDIA_SFU_BASE_URL = "wss://sfu.local"
+        GIGACHAD_SFU_TOKEN_SECRET = "ci-sfu-secret"
+        MEDIA_SFU_TOKEN_SECRET = "ci-sfu-secret"
     }
 
     $server = Start-ProcessWithEnvironment -FilePath $exePath -WorkingDirectory $projectRoot -Environment $childEnv
     if (!(Wait-Health -Port $Port -TimeoutSec $TimeoutSec)) { throw "Server hazir degil." }
 
-    $room = "policy-room"
-    $tenant = "tenant-policy"
+    $room = "sfu-room"
+    $tenant = "tenant-sfu"
 
     $ws1 = [System.Net.WebSockets.ClientWebSocket]::new()
-    $u1 = [System.Uri]("ws://127.0.0.1:$Port/ws?room=$room&user=u1&tenant=$tenant")
-    $ws1.ConnectAsync($u1, [System.Threading.CancellationToken]::None).GetAwaiter().GetResult() | Out-Null
-    $c1 = Wait-Event -Socket $ws1 -Predicate { param($e) $e.type -eq "connected" } -TimeoutSec 8
-    if (-not $c1) { throw "u1 connected eventi gelmedi." }
-    if ($c1.mediaMode -ne "p2p") { throw "u1 mediaMode beklenen p2p, gelen=$($c1.mediaMode)" }
+    $ws1.ConnectAsync([System.Uri]("ws://127.0.0.1:$Port/ws?room=$room&user=u1&tenant=$tenant"), [System.Threading.CancellationToken]::None).GetAwaiter().GetResult() | Out-Null
+    $null = Wait-Event -Socket $ws1 -Predicate { param($e) $e.type -eq "connected" } -TimeoutSec 8
 
     $ws2 = [System.Net.WebSockets.ClientWebSocket]::new()
-    $u2 = [System.Uri]("ws://127.0.0.1:$Port/ws?room=$room&user=u2&tenant=$tenant")
-    $ws2.ConnectAsync($u2, [System.Threading.CancellationToken]::None).GetAwaiter().GetResult() | Out-Null
-    $c2 = Wait-Event -Socket $ws2 -Predicate { param($e) $e.type -eq "connected" } -TimeoutSec 8
-    if (-not $c2) { throw "u2 connected eventi gelmedi." }
-    if ($c2.mediaMode -ne "p2p") { throw "u2 mediaMode beklenen p2p, gelen=$($c2.mediaMode)" }
-
-    $signalBody = '{"type":"webrtc.signal","targetUser":"u2","signalType":"offer","data":"hello-offer"}'
-    Send-WebSocketText -Socket $ws1 -Text $signalBody
-    $relay = Wait-Event -Socket $ws2 -Predicate { param($e) $e.type -eq "webrtc.signal" -and $e.payload.from -eq "u1" -and $e.payload.to -eq "u2" -and $e.payload.signalType -eq "offer" -and $e.payload.data -eq "hello-offer" } -TimeoutSec 8
-    if (-not $relay) { throw "webrtc.signal relay u1->u2 gelmedi." }
-    $ack = Wait-Event -Socket $ws1 -Predicate { param($e) $e.type -eq "webrtc.signal.ack" -and $e.targetUser -eq "u2" } -TimeoutSec 8
-    if (-not $ack) { throw "webrtc.signal ack gelmedi." }
+    $ws2.ConnectAsync([System.Uri]("ws://127.0.0.1:$Port/ws?room=$room&user=u2&tenant=$tenant"), [System.Threading.CancellationToken]::None).GetAwaiter().GetResult() | Out-Null
+    $null = Wait-Event -Socket $ws2 -Predicate { param($e) $e.type -eq "connected" } -TimeoutSec 8
 
     $ws3 = [System.Net.WebSockets.ClientWebSocket]::new()
-    $u3 = [System.Uri]("ws://127.0.0.1:$Port/ws?room=$room&user=u3&tenant=$tenant")
-    $ws3.ConnectAsync($u3, [System.Threading.CancellationToken]::None).GetAwaiter().GetResult() | Out-Null
+    $ws3.ConnectAsync([System.Uri]("ws://127.0.0.1:$Port/ws?room=$room&user=u3&tenant=$tenant"), [System.Threading.CancellationToken]::None).GetAwaiter().GetResult() | Out-Null
     $c3 = Wait-Event -Socket $ws3 -Predicate { param($e) $e.type -eq "connected" } -TimeoutSec 8
-    if (-not $c3) { throw "u3 connected eventi gelmedi." }
+    if (-not $c3) { throw "u3 connected event gelmedi." }
     if ($c3.mediaMode -ne "sfu") { throw "u3 mediaMode beklenen sfu, gelen=$($c3.mediaMode)" }
 
-    Write-Output "PASS: media p2p/sfu policy + webrtc.signal relay calisti."
+    Send-WebSocketText -Socket $ws3 -Text '{"type":"media.peer.sync"}'
+    $sfuRequired = Wait-Event -Socket $ws3 -Predicate { param($e) $e.type -eq "media.sfu.required" -and $e.payload.provider -eq "livekit" -and $e.payload.enabled -eq $true -and $e.payload.baseUrl -eq "wss://sfu.local" } -TimeoutSec 8
+    if (-not $sfuRequired) { throw "media.sfu.required eventi gelmedi." }
+    if ([string]::IsNullOrWhiteSpace($sfuRequired.payload.joinToken)) { throw "media.sfu.required joinToken bos." }
+
+    Send-WebSocketText -Socket $ws1 -Text '{"type":"webrtc.signal","targetUser":"u2","signalType":"offer","data":"blocked-in-sfu"}'
+    $sfuError = Wait-Event -Socket $ws1 -Predicate { param($e) $e.type -eq "error" -and $e.code -eq "sfu_required" } -TimeoutSec 8
+    if (-not $sfuError) { throw "webrtc.signal sfu_required error bekleniyordu." }
+    $relayToU2 = Wait-Event -Socket $ws2 -Predicate { param($e) $e.type -eq "webrtc.signal" -and $e.payload.data -eq "blocked-in-sfu" } -TimeoutSec 3
+    if ($relayToU2) { throw "sfu modunda webrtc.signal relay olmamaliydi." }
+
+    Write-Output "PASS: sfu policy event + direct signaling block calisti."
 }
 finally {
     foreach ($ws in @($ws1, $ws2, $ws3)) {
         if ($ws) {
             try {
                 if ($ws.State -eq [System.Net.WebSockets.WebSocketState]::Open) {
-                    $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "done", [System.Threading.CancellationToken]::None).GetAwaiter().GetResult()
+                    $ws.CloseAsync([System.Net.WebSockets.WebSocketCloseStatus]::NormalClosure, "done", [System.Threading.CancellationToken]::None).GetAwaiter().GetResult() | Out-Null
                 }
             } catch {}
             $ws.Dispose()

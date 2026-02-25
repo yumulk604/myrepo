@@ -55,8 +55,9 @@
 - [+] Realtime Core: Passkey EdDSA (alg=-8 / Ed25519) production rollout localde dogrulandi (Windows + libsodium.dll ile canli entegrasyon testi PASS).
 
 - [+] Media Plane: 2-10 kisi icin P2P WebRTC signaling mesh akisi eklendi (WS peer list + hedefli signal relay).
-- [-] Media Plane: 10+ icin SFU fallback (LiveKit veya mediasoup).
+- [+] Media Plane: 10+ icin SFU fallback control-plane eklendi (`media.sfu.required`, provider env, joinToken placeholder, direct signal bloklama).
 - [+] Media Plane: Oda boyutuna gore otomatik route/policy engine eklendi (p2p/sfu mode flag, threshold env ile).
+- [-] Media Plane: SFU provider data-plane entegrasyonu (LiveKit/mediasoup ile gercek room/session create+join akisi).
 
 - [-] Federation: Matrix'in control-plane olarak baglanmasi.
 - [-] Federation: Room/identity/bridge adapter katmaninin eklenmesi.
@@ -110,6 +111,7 @@
 - [+] WebSocket hedefli WebRTC signal relay eklendi (`webrtc.signal` + `webrtc.signal.ack`, room+tenant scoped).
 - [+] /api/health icine media routing policy bilgisi eklendi (`mediaRouting.p2pThreshold`, policy aciklamasi).
 - [+] test_media_p2p_policy.ps1 eklendi ve PASS alindi (p2p->sfu mode gecisi + signal relay/ack).
+- [+] test_media_sfu_policy.ps1 eklendi ve PASS alindi (`media.sfu.required` event + sfu modunda direct signal bloklama).
 
 
 

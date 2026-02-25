@@ -3615,6 +3615,79 @@ std::string buildRoomPolicyPayloadJson(const std::string& roomId, const std::str
     return ss.str();
 }
 
+std::string detectSfuProvider() {
+    static const std::string provider = []() {
+        std::string raw = toLower(trimWhitespace(getEnvStringWithFallback("GIGACHAD_SFU_PROVIDER", "MEDIA_SFU_PROVIDER", "livekit")));
+        if (raw.empty()) return std::string("livekit");
+        return raw;
+    }();
+    return provider;
+}
+
+bool sfuEnabled() {
+    static const int enabled = getEnvIntWithFallback("GIGACHAD_SFU_ENABLED", "MEDIA_SFU_ENABLED", 1);
+    return enabled != 0;
+}
+
+std::string sfuBaseUrl() {
+    static const std::string url = trimWhitespace(getEnvStringWithFallback("GIGACHAD_SFU_BASE_URL", "MEDIA_SFU_BASE_URL", ""));
+    return url;
+}
+
+std::string sfuTokenSecret() {
+    static const std::string secret = trimWhitespace(getEnvStringWithFallback("GIGACHAD_SFU_TOKEN_SECRET", "MEDIA_SFU_TOKEN_SECRET", ""));
+    return secret;
+}
+
+std::string generateSfuJoinToken(
+    const std::string& userId,
+    const std::string& roomId,
+    const std::string& tenantId,
+    const std::string& provider
+) {
+    const int now = nowEpochSec();
+    const int exp = now + 900;
+    const std::string payloadJson =
+        "{"
+        "\"sub\":\"" + escapeJSONString(userId) + "\","
+        "\"roomId\":\"" + escapeJSONString(roomId) + "\","
+        "\"tenantId\":\"" + escapeJSONString(normalizeTenantId(tenantId)) + "\","
+        "\"provider\":\"" + escapeJSONString(provider) + "\","
+        "\"iat\":" + std::to_string(now) + ","
+        "\"exp\":" + std::to_string(exp) +
+        "}";
+    const std::string payloadB64 = base64UrlEncode(reinterpret_cast<const uint8_t*>(payloadJson.data()), payloadJson.size());
+    const std::string secret = sfuTokenSecret();
+    if (secret.empty()) {
+        return "sfu-placeholder." + payloadB64;
+    }
+    const auto sig = hmacSha256(secret, payloadB64);
+    const std::string sigB64 = base64UrlEncode(sig.data(), sig.size());
+    return "sfu-v1." + payloadB64 + "." + sigB64;
+}
+
+std::string buildSfuRequiredPayloadJson(
+    const std::string& roomId,
+    const std::string& tenantId,
+    const std::string& userId,
+    const std::string& reason
+) {
+    const std::string provider = detectSfuProvider();
+    const std::string token = generateSfuJoinToken(userId, roomId, tenantId, provider);
+    std::stringstream ss;
+    ss << "{"
+       << "\"roomId\":\"" << escapeJSONString(roomId) << "\","
+       << "\"tenantId\":\"" << escapeJSONString(normalizeTenantId(tenantId)) << "\","
+       << "\"userId\":\"" << escapeJSONString(userId) << "\","
+       << "\"provider\":\"" << escapeJSONString(provider) << "\","
+       << "\"enabled\":" << (sfuEnabled() ? "true" : "false") << ","
+       << "\"baseUrl\":\"" << escapeJSONString(sfuBaseUrl()) << "\","
+       << "\"joinToken\":\"" << escapeJSONString(token) << "\","
+       << "\"reason\":\"" << escapeJSONString(reason) << "\""
+       << "}";
+    return ss.str();
+}
+
 std::string buildEventFramePayload(const std::string& type, const std::string& payloadJson, const std::string& roomId = "", const std::string& tenantId = "default") {
     std::stringstream ss;
     ss << "{"
@@ -5282,6 +5355,10 @@ void handleWebSocketClient(int clientSocket, const HTTPRequest& req, const std::
         client.tenantId
     );
     broadcastEvent("media.peer.joined", roomPolicyPayload, client.roomId, client.tenantId);
+    if (roomMediaMode == "sfu") {
+        const std::string sfuPayload = buildSfuRequiredPayloadJson(client.roomId, client.tenantId, client.userId, "room_size_threshold");
+        broadcastEvent("media.sfu.required", sfuPayload, client.roomId, client.tenantId);
+    }
     if (!sendWebSocketFrame(clientSocket, 0x1, buildEventFramePayload("media.peer.list", roomPolicyPayload, client.roomId, client.tenantId))) {
         removeWebSocketClient(clientSocket);
         closeClientSocket(clientSocket);
@@ -5323,8 +5400,15 @@ void handleWebSocketClient(int clientSocket, const HTTPRequest& req, const std::
         const std::string frameType = trimWhitespace(extractJSONValue(payload, "type"));
         if (frameType == "media.peer.sync") {
             const std::string syncPayload = buildRoomPolicyPayloadJson(client.roomId, client.tenantId);
+            const std::string syncMode = extractJSONValue(syncPayload, "mediaMode");
             if (!sendWebSocketFrame(clientSocket, 0x1, buildEventFramePayload("media.peer.list", syncPayload, client.roomId, client.tenantId))) {
                 break;
+            }
+            if (syncMode == "sfu") {
+                const std::string sfuPayload = buildSfuRequiredPayloadJson(client.roomId, client.tenantId, client.userId, "sync");
+                if (!sendWebSocketFrame(clientSocket, 0x1, buildEventFramePayload("media.sfu.required", sfuPayload, client.roomId, client.tenantId))) {
+                    break;
+                }
             }
             continue;
         }
@@ -5355,6 +5439,18 @@ void handleWebSocketClient(int clientSocket, const HTTPRequest& req, const std::
             }
             if (normalizeTenantId(requestedTenant) != effectiveTenant) {
                 if (!sendWebSocketFrame(clientSocket, 0x1, "{\"type\":\"error\",\"code\":\"tenant_mismatch\",\"message\":\"WebRTC signaling tenant mismatch\"}")) {
+                    break;
+                }
+                continue;
+            }
+            const std::string policyPayload = buildRoomPolicyPayloadJson(effectiveRoom, effectiveTenant);
+            const std::string policyMode = extractJSONValue(policyPayload, "mediaMode");
+            if (policyMode == "sfu") {
+                const std::string sfuPayload = buildSfuRequiredPayloadJson(effectiveRoom, effectiveTenant, client.userId, "signal_blocked_sfu_required");
+                if (!sendWebSocketFrame(clientSocket, 0x1, buildEventFramePayload("media.sfu.required", sfuPayload, effectiveRoom, effectiveTenant))) {
+                    break;
+                }
+                if (!sendWebSocketFrame(clientSocket, 0x1, "{\"type\":\"error\",\"code\":\"sfu_required\",\"message\":\"Direct webrtc.signal blocked while room policy is sfu\"}")) {
                     break;
                 }
                 continue;
@@ -5391,6 +5487,10 @@ void handleWebSocketClient(int clientSocket, const HTTPRequest& req, const std::
     );
     const std::string roomPolicyAfterLeave = buildRoomPolicyPayloadJson(client.roomId, client.tenantId);
     broadcastEvent("media.peer.left", roomPolicyAfterLeave, client.roomId, client.tenantId);
+    if (extractJSONValue(roomPolicyAfterLeave, "mediaMode") == "sfu") {
+        const std::string sfuPayload = buildSfuRequiredPayloadJson(client.roomId, client.tenantId, client.userId, "room_still_sfu_after_leave");
+        broadcastEvent("media.sfu.required", sfuPayload, client.roomId, client.tenantId);
+    }
     closeClientSocket(clientSocket);
 }
 
@@ -5504,7 +5604,9 @@ HTTPResponse handleRequest(const HTTPRequest& req) {
       "GET /ws?room={roomId}&user={userId}&tenant={tenantId}&token={token}": "WebSocket event stream",
       "WS message type webrtc.signal": "Direct room+tenant scoped offer/answer/ice relay to targetUser",
       "WS message type media.peer.sync": "Request current room peers + routing mode snapshot",
-      "Media routing env": "GIGACHAD_MEDIA_P2P_MAX_PEERS or MEDIA_P2P_MAX_PEERS"
+      "WS event media.sfu.required": "Room policy switched to SFU; includes provider/baseUrl/joinToken placeholder",
+      "Media routing env": "GIGACHAD_MEDIA_P2P_MAX_PEERS or MEDIA_P2P_MAX_PEERS",
+      "SFU env": "GIGACHAD_SFU_ENABLED, GIGACHAD_SFU_PROVIDER, GIGACHAD_SFU_BASE_URL, GIGACHAD_SFU_TOKEN_SECRET (MEDIA_* aliases)"
     }
   }
 })JSON";
@@ -5528,7 +5630,9 @@ HTTPResponse handleRequest(const HTTPRequest& req) {
            << "\"eventBusRedisReady\":" << (g_eventBusRedisReady.load() ? "true" : "false") << ","
            << "\"mediaRouting\":{"
            << "\"p2pThreshold\":" << mediaP2PMaxPeers() << ","
-           << "\"policy\":\"p2p_if_room_size_lte_threshold_else_sfu\""
+           << "\"policy\":\"p2p_if_room_size_lte_threshold_else_sfu\","
+           << "\"sfuEnabled\":" << (sfuEnabled() ? "true" : "false") << ","
+           << "\"sfuProvider\":\"" << escapeJSONString(detectSfuProvider()) << "\""
            << "},"
            << "\"stats\":{"
            << "\"messages\":" << messages.size() << ","
